@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
+"""
+Module for streaming screen content over UDP using FFmpeg.
+"""
+
 import subprocess
-import argparse
-import signal
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
+
 
 class ScreenStreamer:
-    def __init__(self, width: int, height: int, framerate: int = 30,
-                 output: str = "HDMI-1", offset_x: int = 0, offset_y: int = 0,
-                 udp_target: str = "udp://192.168.1.156:5001",
-                 bitrate: str = "1M", preset: str = "ultrafast",
-                 tune: str = "zerolatency", qp: int = 30):
+    """Handles streaming screen content over UDP using FFmpeg."""
+    
+    def __init__(self, 
+                 width: int, 
+                 height: int, 
+                 framerate: int = 30,
+                 output: str = "HDMI-1", 
+                 offset_x: int = 0, 
+                 offset_y: int = 0,
+                 udp_target: str = "udp://10.1.10.251:5001",
+                 bitrate: str = "1M", 
+                 preset: str = "ultrafast",
+                 tune: str = "zerolatency", 
+                 qp: int = 30):
         """
         Initialize the screen streamer with capture and encoding parameters.
         
@@ -22,7 +34,7 @@ class ScreenStreamer:
             output: X11 display output name (e.g., HDMI-1)
             offset_x: X offset for capture (from left of display)
             offset_y: Y offset for capture (from top of display)
-            udp_target: UDP target address (e.g., "udp://192.168.1.156:5001")
+            udp_target: UDP target address (e.g., "udp://10.1.10.251:5001")
             bitrate: Target bitrate (e.g., "1M")
             preset: Encoding preset (e.g., "ultrafast")
             tune: Encoding tuning (e.g., "zerolatency")
@@ -41,7 +53,7 @@ class ScreenStreamer:
         self.qp = qp
         self.process = None
 
-    def get_display_position(self) -> Optional[tuple]:
+    def get_display_position(self) -> Optional[Tuple[int, int]]:
         """Get the position of the specified output relative to the main display."""
         try:
             output = subprocess.check_output(["xrandr"], text=True)
@@ -128,69 +140,25 @@ class ScreenStreamer:
                 self.process.kill()
             print("Streaming stopped")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Capture and stream an extended screen over UDP with low latency",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    # Capture parameters
-    parser.add_argument("width", type=int, help="Width of the capture area")
-    parser.add_argument("height", type=int, help="Height of the capture area")
-    parser.add_argument("--framerate", type=int, default=30,
-                       help="Target framerate")
-    parser.add_argument("--output", default="HDMI-1",
-                       help="X11 display output name")
-    
-    # Network parameters
-    parser.add_argument("--udp-target", default="udp://192.168.1.156:5001",
-                       help="UDP target address")
-    
-    # Encoding parameters
-    parser.add_argument("--bitrate", default="1M",
-                       help="Target bitrate (e.g., 1M, 500K)")
-    parser.add_argument("--preset", default="ultrafast",
-                       choices=["ultrafast", "superfast", "veryfast", "faster", "fast"],
-                       help="Encoding preset")
-    parser.add_argument("--tune", default="zerolatency",
-                       choices=["zerolatency", "fastdecode"],
-                       help="Encoding tuning")
-    parser.add_argument("--qp", type=int, default=30,
-                       help="Quantization parameter (0-51, lower is better quality)")
-    
-    args = parser.parse_args()
 
-    # Initialize streamer
-    streamer = ScreenStreamer(
-        width=args.width,
-        height=args.height,
-        framerate=args.framerate,
-        output=args.output,
-        udp_target=args.udp_target,
-        bitrate=args.bitrate,
-        preset=args.preset,
-        tune=args.tune,
-        qp=args.qp
+# Import function for the module
+def create_streamer_from_config(config: Dict[str, Any]) -> ScreenStreamer:
+    """Create a ScreenStreamer instance from a configuration dictionary."""
+    return ScreenStreamer(
+        width=config['width'],
+        height=config['height'],
+        framerate=config['framerate'],
+        output=config['output'],
+        udp_target=config['udp_target'],
+        bitrate=config['bitrate'],
+        preset=config['preset'],
+        tune=config['tune'],
+        qp=config['qp']
     )
 
-    # Handle Ctrl-C gracefully
-    def signal_handler(sig, frame):
-        print("\nStopping stream...")
-        streamer.stop_streaming()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # Start streaming
-    if not streamer.start_streaming():
-        sys.exit(1)
-
-    print("Streaming started. Press Ctrl+C to stop...")
-    while True:
-        time.sleep(1)
-        if streamer.process.poll() is not None:
-            print("Streaming process ended unexpectedly")
-            break
 
 if __name__ == "__main__":
-    main()
+    # This functionality is now delegated to screen_manager.py
+    print("This module should be imported by screen_manager.py.")
+    print("For standalone usage, please use screen_manager.py with appropriate arguments.")
+    sys.exit(0)

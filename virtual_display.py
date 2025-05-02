@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-import subprocess
-import argparse
-import sys
-import re
+"""
+Module for managing virtual displays using xrandr.
+"""
 
-def run_command(cmd, check=True):
+import subprocess
+import sys
+from typing import Optional, Dict, Any
+
+
+def run_command(cmd: str, check: bool = True) -> Optional[str]:
     """Execute a shell command and return its output."""
     try:
         result = subprocess.run(cmd, shell=True, check=check,
@@ -17,7 +21,8 @@ def run_command(cmd, check=True):
         print(e.stderr)
         return None
 
-def get_current_screens():
+
+def get_current_screens() -> Optional[Dict[str, Any]]:
     """Get information about currently connected screens."""
     output = run_command("xrandr")
     if not output:
@@ -56,12 +61,14 @@ def get_current_screens():
     
     return screens
 
-def check_mode_exists(mode_name):
+
+def check_mode_exists(mode_name: str) -> bool:
     """Check if a display mode already exists."""
     output = run_command("xrandr")
     return mode_name in output
 
-def create_mode(width, height, refresh_rate):
+
+def create_mode(width: int, height: int, refresh_rate: float) -> Optional[str]:
     """Create a new display mode using cvt and xrandr."""
     mode_name = f"{width}x{height}_{refresh_rate:.2f}"
     
@@ -69,7 +76,7 @@ def create_mode(width, height, refresh_rate):
         print(f"Mode {mode_name} already exists.")
         return mode_name
     
-    # Step 1: Generate modeline with cvt
+    # Generate modeline with cvt
     cvt_output = run_command(f"cvt {width} {height} {refresh_rate}")
     if not cvt_output:
         print("Failed to generate modeline with cvt")
@@ -79,14 +86,14 @@ def create_mode(width, height, refresh_rate):
     modeline = None
     for line in cvt_output.splitlines():
         if line.startswith('Modeline'):
-            modeline = line.split('Modeline ')[1].strip('"')
+            modeline = line.split('Modeline')[1].strip().split('"')[2].strip()
             break
     
     if not modeline:
         print("Could not extract modeline from cvt output")
         return None
     
-    # Step 2: Create new mode with xrandr
+    # Create new mode with xrandr
     newmode_cmd = f'xrandr --newmode "{mode_name}" {modeline}'
     if run_command(newmode_cmd) is None:
         return None
@@ -94,14 +101,19 @@ def create_mode(width, height, refresh_rate):
     print(f"Created new mode: {mode_name}")
     return mode_name
 
-def setup_extended_screen(mode_name, output_name="HDMI-1", position="left-of", relative_to="eDP-1"):
+
+def setup_extended_screen(
+        mode_name: str, 
+        output_name: str = "HDMI-1", 
+        position: str = "left-of", 
+        relative_to: str = "eDP-1") -> bool:
     """Set up the extended screen with the specified mode."""
-    # Step 4: Add mode to output
+    # Add mode to output
     addmode_cmd = f'xrandr --addmode {output_name} {mode_name}'
     if run_command(addmode_cmd) is None:
         return False
     
-    # Step 5: Position the screen
+    # Position the screen
     position_cmd = f'xrandr --output {output_name} --mode {mode_name} --{position} {relative_to}'
     if run_command(position_cmd) is None:
         return False
@@ -109,7 +121,8 @@ def setup_extended_screen(mode_name, output_name="HDMI-1", position="left-of", r
     print(f"Successfully set up {output_name} with mode {mode_name} {position} {relative_to}")
     return True
 
-def cleanup(output_name="HDMI-1", mode_name=None):
+
+def cleanup(output_name: str = "HDMI-1", mode_name: Optional[str] = None) -> None:
     """Clean up by turning off the output and deleting the mode."""
     if mode_name:
         # Remove the mode from the output first
@@ -119,59 +132,11 @@ def cleanup(output_name="HDMI-1", mode_name=None):
     
     # Turn off the output
     run_command(f'xrandr --output {output_name} --off', check=False)
-    print("Cleanup complete")
+    print("Display cleanup complete")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Manage custom display resolutions for extended screens",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    parser.add_argument("width", type=int, help="Width of the display in pixels")
-    parser.add_argument("height", type=int, help="Height of the display in pixels")
-    parser.add_argument("refresh_rate", type=float, help="Refresh rate in Hz")
-    
-    parser.add_argument("--output", default="HDMI-1",
-                       help="Output name for the extended screen")
-    parser.add_argument("--relative-to", default="eDP-1",
-                       help="Primary screen to position relative to")
-    parser.add_argument("--position", default="left-of",
-                       choices=["left-of", "right-of", "above", "below"],
-                       help="Position relative to primary screen")
-    parser.add_argument("--no-cleanup", action="store_true",
-                       help="Don't automatically clean up after setup")
-    
-    args = parser.parse_args()
-    
-    # Check current screens
-    screens = get_current_screens()
-    if not screens:
-        print("Could not get screen information")
-        return 1
-    
-    # Check if the specified output is already in use
-    if args.output in screens and screens[args.output]['status'] == "connected":
-        print(f"Output {args.output} is already connected and in use")
-        return 1
-    
-    # Create the new mode
-    mode_name = create_mode(args.width, args.height, args.refresh_rate)
-    if not mode_name:
-        return 1
-    
-    # Set up the extended screen
-    if not setup_extended_screen(mode_name, args.output, args.position, args.relative_to):
-        cleanup(args.output, mode_name)
-        return 1
-    
-    if not args.no_cleanup:
-        try:
-            print("\nPress Enter to clean up and exit...")
-            input()
-        finally:
-            cleanup(args.output, mode_name)
-    
-    return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # This functionality is now delegated to screen_manager.py
+    print("This module should be imported by screen_manager.py.")
+    print("For standalone usage, please use screen_manager.py with appropriate arguments.")
+    sys.exit(0)

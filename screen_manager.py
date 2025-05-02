@@ -1,68 +1,121 @@
 #!/usr/bin/env python3
+"""
+Main module for managing virtual displays and streaming screen content.
+
+This program creates custom display resolutions for extended screens and
+streams the content over UDP with low latency using FFmpeg.
+"""
+
 import argparse
 import sys
 import time
 import signal
-from virtual_display import setup_extended_screen, cleanup, get_current_screens
-from screen_streamer import ScreenStreamer
+
+# Import modules
+import virtual_display as vd
+from screen_streamer import ScreenStreamer, create_streamer_from_config
+
 
 class ScreenManagerStreamer:
+    """Main class that combines display management and streaming functionality."""
+    
     def __init__(self):
+        """Initialize the screen manager."""
         self.streamer = None
         self.cleanup_needed = False
+        self.output_name = None
+        self.mode_name = None
 
-    def setup_and_stream(self, args):
-        """Main function that handles both screen setup and streaming"""
-        # First setup the extended screen
-        screens = get_current_screens()
+    def setup_and_stream(self, config):
+        """Main function that handles both screen setup and streaming."""
+        # Store important values for cleanup
+        self.output_name = config['output']
+        self.mode_name = f"{config['width']}x{config['height']}_{config['refresh_rate']:.2f}"
+        
+        # Check current screens 
+        screens = vd.get_current_screens()
         if not screens:
             print("Could not get screen information")
             return False
 
         # Check if the specified output is already in use
-        if args.output in screens and screens[args.output]['status'] == "connected":
-            print(f"Output {args.output} is already connected and in use")
+        if config['output'] in screens and screens[config['output']]['status'] == "connected":
+            print(f"Output {config['output']} is already connected and in use")
             return False
 
-        # Create the new mode and setup the screen
-        mode_name = f"{args.width}x{args.height}_{args.refresh_rate:.2f}"
-        if not setup_extended_screen(mode_name, args.output, args.position, args.relative_to):
+        # Create the new mode if needed
+        if not vd.create_mode(config['width'], config['height'], config['refresh_rate']):
             return False
+
+        # Setup the extended screen
+        if not vd.setup_extended_screen(
+                self.mode_name, config['output'], config['position'], config['relative_to']):
+            self.cleanup()
+            return False
+        
         self.cleanup_needed = True
 
         # Give the display a moment to stabilize
         time.sleep(2)
 
         # Now setup the streamer
-        self.streamer = ScreenStreamer(
-            width=args.width,
-            height=args.height,
-            framerate=args.framerate,
-            output=args.output,
-            udp_target=args.udp_target,
-            bitrate=args.bitrate,
-            preset=args.preset,
-            tune=args.tune,
-            qp=args.qp
-        )
+        self.streamer = create_streamer_from_config(config)
 
         if not self.streamer.start_streaming():
-            self.cleanup(args.output, mode_name)
+            self.cleanup()
             return False
 
         return True
 
-    def cleanup(self, output_name="HDMI-1", mode_name=None):
-        """Clean up both streaming and screen setup"""
+    def setup_only(self, config):
+        """Set up the display without streaming."""
+        # Store important values for cleanup
+        self.output_name = config['output']
+        self.mode_name = f"{config['width']}x{config['height']}_{config['refresh_rate']:.2f}"
+        
+        # Check current screens
+        screens = vd.get_current_screens()
+        if not screens:
+            print("Could not get screen information")
+            return False
+
+        # Check if the specified output is already in use
+        if config['output'] in screens and screens[config['output']]['status'] == "connected":
+            print(f"Output {config['output']} is already connected and in use")
+            return False
+
+        # Create the new mode if needed
+        if not vd.create_mode(config['width'], config['height'], config['refresh_rate']):
+            return False
+
+        # Setup the extended screen
+        if not vd.setup_extended_screen(
+                self.mode_name, config['output'], config['position'], config['relative_to']):
+            self.cleanup()
+            return False
+        
+        self.cleanup_needed = True
+        print(f"Successfully set up display {config['output']} with mode {self.mode_name}")
+        return True
+
+    def stream_only(self, config):
+        """Stream without setting up a new display mode."""
+        self.streamer = create_streamer_from_config(config)
+        return self.streamer.start_streaming()
+
+    def cleanup(self):
+        """Clean up both streaming and screen setup."""
         if self.streamer:
             self.streamer.stop_streaming()
         
-        if self.cleanup_needed:
-            cleanup(output_name, mode_name)
+        if self.cleanup_needed and self.output_name and self.mode_name:
+            vd.cleanup(self.output_name, self.mode_name)
         
         self.cleanup_needed = False
 
-def main():
+
+def parse_arguments():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Manage custom display resolutions and stream the extended screen",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -96,33 +149,68 @@ def main():
                        help="Encoding tuning")
     parser.add_argument("--qp", type=int, default=30,
                        help="Quantization parameter (0-51, lower is better quality)")
+    
+    # Operation modes
+    parser.add_argument("--setup-only", action="store_true",
+                       help="Only set up the display without streaming")
+    parser.add_argument("--stream-only", action="store_true",
+                       help="Only stream without setting up a new display mode")
     parser.add_argument("--no-cleanup", action="store_true",
                        help="Don't automatically clean up after setup")
     
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def main():
+    """Main entry point for the program."""
+    args = parse_arguments()
+    
+    # Convert args to a config dictionary
+    config = vars(args)
+    
     manager = ScreenManagerStreamer()
 
     # Handle Ctrl-C gracefully
     def signal_handler(sig, frame):
         print("\nStopping stream and cleaning up...")
-        manager.cleanup(args.output, f"{args.width}x{args.height}_{args.refresh_rate:.2f}")
+        if not args.no_cleanup:
+            manager.cleanup()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    if not manager.setup_and_stream(args):
-        sys.exit(1)
-
-    print("Streaming started. Press Ctrl+C to stop...")
     try:
+        if args.setup_only:
+            # Only set up the display
+            if not manager.setup_only(config):
+                sys.exit(1)
+            print("Display setup complete. Press Ctrl+C to clean up...")
+                
+        elif args.stream_only:
+            # Only stream without setting up a display
+            if not manager.stream_only(config):
+                sys.exit(1)
+            print("Streaming started. Press Ctrl+C to stop...")
+                
+        else:
+            # Default: setup and stream
+            if not manager.setup_and_stream(config):
+                sys.exit(1)
+            print("Streaming started. Press Ctrl+C to stop...")
+        
+        # Main loop
         while True:
             time.sleep(1)
+            if manager.streamer and manager.streamer.process and manager.streamer.process.poll() is not None:
+                print("Streaming process ended unexpectedly")
+                break
+                    
     except KeyboardInterrupt:
-        pass
+        print("\nOperation interrupted by user")
     finally:
         if not args.no_cleanup:
-            manager.cleanup(args.output, f"{args.width}x{args.height}_{args.refresh_rate:.2f}")
+            manager.cleanup()
+
 
 if __name__ == "__main__":
     main()
