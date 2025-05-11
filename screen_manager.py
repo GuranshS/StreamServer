@@ -12,8 +12,85 @@ import subprocess
 import sys
 import time
 from typing import Dict, Any, Optional, Tuple
+import socket
+import json
+import threading
 
-
+class ControlServer:
+    def __init__(self, port=5000):
+        self.port = port
+        self.server_socket = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.current_config = None
+        
+    def start(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('0.0.0.0', self.port))
+        self.server_socket.listen(1)
+        self.running = True
+        
+        threading.Thread(target=self._accept_connections, daemon=True).start()
+    
+    def _accept_connections(self):
+        while self.running:
+            try:
+                client_socket, addr = self.server_socket.accept()
+                threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, addr)
+                ).start()
+            except Exception as e:
+                if self.running:
+                    print(f"Accept error: {e}")
+    
+    def _handle_client(self, client_socket, addr):
+        try:
+            print(f"Client connected: {addr}")
+            data = client_socket.recv(1024).decode()
+            if not data:
+                return
+                
+            message = json.loads(data)
+            print(f"Received: {message}")
+            
+            if message.get('command') == 'setup':
+                with self.lock:
+                    self.current_config = {
+                        'width': message['width'],
+                        'height': message['height'],
+                        'refresh_rate': message['refresh_rate'],
+                        'udp_target': f"udp://{socket.gethostbyname(socket.gethostname())}:{message['udp_port']}"
+                    }
+                
+                response = {
+                    'status': 'ready',
+                    'udp_target': self.current_config['udp_target']
+                }
+                client_socket.send(json.dumps(response).encode())
+                
+        except Exception as e:
+            print(f"Client handling error: {e}")
+        finally:
+            client_socket.close()
+    
+    def wait_for_client_config(self):
+        """Wait for and return client configuration."""
+        while self.running:
+            with self.lock:
+                if self.current_config:
+                    config = self.current_config.copy()
+                    self.current_config = None
+                    return config
+            time.sleep(0.1)
+        return None
+    
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+            
 class DisplayManager:
     """Manages virtual displays using xrandr."""
     
@@ -323,15 +400,22 @@ class ScreenStreamer:
             print("Streaming stopped")
 
 
+
 class ScreenManager:
-    """Main class that manages both display setup and streaming."""
-    
     def __init__(self):
-        """Initialize the screen manager."""
         self.streamer = None
         self.output_name = None
         self.mode_name = None
         self.cleanup_needed = False
+        self.control_server = ControlServer()
+        
+    def start_control_server(self):
+        """Start the TCP control server."""
+        self.control_server.start()
+        
+    def wait_for_client_config(self) -> Optional[Dict[str, Any]]:
+        """Wait for client configuration over TCP."""
+        return self.control_server.handle_client()
     
     def setup_display(self, config: Dict[str, Any]) -> bool:
         """Setup the display with the given configuration."""
@@ -441,13 +525,11 @@ def parse_arguments():
 
 
 def main():
-    """Main entry point for the program."""
     args = parse_arguments()
     config = vars(args)
     
     manager = ScreenManager()
     
-    # Handle Ctrl-C gracefully
     def signal_handler(sig, frame):
         print("\nStopping and cleaning up...")
         if not args.no_cleanup:
@@ -456,7 +538,22 @@ def main():
     
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Start control server
+    control_server = ControlServer()
+    control_server.start()
+    print("Control server started on port 5000. Waiting for client connection...")
+    
     try:
+        # Wait for client configuration
+        client_config = None
+        while not client_config:
+            print("Waiting for client to connect...")
+            client_config = control_server.wait_for_client_config()
+            time.sleep(1)
+        
+        # Merge client config with command line args
+        config.update(client_config)
+        
         if args.setup_only:
             if not manager.setup_display(config):
                 sys.exit(1)
@@ -485,7 +582,7 @@ def main():
     finally:
         if not args.no_cleanup:
             manager.cleanup()
-
+        control_server.stop()
 
 if __name__ == "__main__":
     main()
