@@ -13,84 +13,8 @@ import sys
 import time
 from typing import Dict, Any, Optional, Tuple
 import socket
-import json
-import threading
 
-class ControlServer:
-    def __init__(self, port=5000):
-        self.port = port
-        self.server_socket = None
-        self.running = False
-        self.lock = threading.Lock()
-        self.current_config = None
-        
-    def start(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind(('0.0.0.0', self.port))
-        self.server_socket.listen(1)
-        self.running = True
-        
-        threading.Thread(target=self._accept_connections, daemon=True).start()
-    
-    def _accept_connections(self):
-        while self.running:
-            try:
-                client_socket, addr = self.server_socket.accept()
-                threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, addr)
-                ).start()
-            except Exception as e:
-                if self.running:
-                    print(f"Accept error: {e}")
-    
-    def _handle_client(self, client_socket, addr):
-        try:
-            print(f"Client connected: {addr}")
-            data = client_socket.recv(1024).decode()
-            if not data:
-                return
-                
-            message = json.loads(data)
-            print(f"Received: {message}")
-            
-            if message.get('command') == 'setup':
-                with self.lock:
-                    self.current_config = {
-                        'width': message['width'],
-                        'height': message['height'],
-                        'refresh_rate': message['refresh_rate'],
-                        'udp_target': f"udp://{socket.gethostbyname(socket.gethostname())}:{message['udp_port']}"
-                    }
-                
-                response = {
-                    'status': 'ready',
-                    'udp_target': self.current_config['udp_target']
-                }
-                client_socket.send(json.dumps(response).encode())
-                
-        except Exception as e:
-            print(f"Client handling error: {e}")
-        finally:
-            client_socket.close()
-    
-    def wait_for_client_config(self):
-        """Wait for and return client configuration."""
-        while self.running:
-            with self.lock:
-                if self.current_config:
-                    config = self.current_config.copy()
-                    self.current_config = None
-                    return config
-            time.sleep(0.1)
-        return None
-    
-    def stop(self):
-        self.running = False
-        if self.server_socket:
-            self.server_socket.close()
-            
+
 class DisplayManager:
     """Manages virtual displays using xrandr."""
     
@@ -229,6 +153,8 @@ class ScreenStreamer:
         # Add explicit offset parameters with defaults
         self.offset_x = config.get('offset_x', None)
         self.offset_y = config.get('offset_y', None)
+        # Add wait time for client dimensions
+        self.dimension_wait_time = config.get('dimension_wait_time', 10.0)  # Default to 10 seconds
     
     def get_display_position(self) -> Tuple[int, int]:
         """Get the position of the specified output."""
@@ -365,9 +291,65 @@ class ScreenStreamer:
         ]
         
         return " ".join(cmd)
-    
-    def start(self) -> bool:
+   
+    def wait_for_dimensions(self) -> Optional[Tuple[int, int, str]]:
+        """Wait briefly for client dimensions packet and return width, height, and client IP."""
+        try:
+            # Extract port from UDP target
+            target_parts = self.udp_target.split(':')
+            if len(target_parts) >= 3:
+                port = int(target_parts[2])
+                
+                # Create a socket to listen briefly for dimensions
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(('0.0.0.0', port))
+                sock.settimeout(self.dimension_wait_time)  # Use configurable wait time
+                
+                print(f"Waiting for client dimensions on port {port} for {self.dimension_wait_time} seconds...")
+                data, addr = sock.recvfrom(1024)
+                message = data.decode('utf-8')
+                
+                # Check if this is a dimensions packet
+                if message.startswith("DIMS:"):
+                    parts = message.split(':')
+                    client_ip = addr[0]  # Default to source IP of the packet
+                    
+                    if len(parts) >= 3:
+                        width = int(parts[1])
+                        height = int(parts[2])
+                        
+                        # If client included its IP, use that instead
+                        if len(parts) >= 4 and parts[3]:
+                            client_ip = parts[3]
+                        
+                        print(f"Received client dimensions: {width}x{height} from {client_ip}")
+                        sock.close()
+                        return width, height, client_ip
+                
+                sock.close()
+        except Exception as e:
+            print(f"Error receiving dimensions: {e}")
+        
+        print("Using default dimensions and target")
+        return None
+
+    def start(self, skip_dimension_check=False) -> bool:
         """Start the streaming process."""
+        # Listen for client dimensions first if not skipping dimension check
+        if not skip_dimension_check:
+            client_info = self.wait_for_dimensions()
+            if client_info:
+                width, height, client_ip = client_info
+                self.width = width
+                self.height = height
+                
+                # Update UDP target to use client's IP while keeping port
+                udp_parts = self.udp_target.split(':')
+                port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
+                self.udp_target = f"udp://{client_ip}:{port}"
+                print(f"Updated stream dimensions to client size: {width}x{height}")
+                print(f"Updated UDP target to: {self.udp_target}")
+        
         cmd = self.build_ffmpeg_command()
         print(f"Starting stream with command:\n{cmd}")
         
@@ -400,48 +382,85 @@ class ScreenStreamer:
             print("Streaming stopped")
 
 
-
 class ScreenManager:
+    """Main class that manages both display setup and streaming."""
+    
     def __init__(self):
+        """Initialize the screen manager."""
         self.streamer = None
         self.output_name = None
         self.mode_name = None
         self.cleanup_needed = False
-        self.control_server = ControlServer()
-        
-    def start_control_server(self):
-        """Start the TCP control server."""
-        self.control_server.start()
-        
-    def wait_for_client_config(self) -> Optional[Dict[str, Any]]:
-        """Wait for client configuration over TCP."""
-        return self.control_server.handle_client()
+        self.fallback_width = 1920  # Fallback resolution values
+        self.fallback_height = 1200
+    
+    def is_crtc_error(self, error_output: str) -> bool:
+        """Check if the error output contains a CRTC error."""
+        crtc_errors = [
+            "CRTC",
+            "crtc",
+            "failed to set mode",
+            "cannot set mode",
+            "Configure crtc"
+        ]
+        return any(error.lower() in error_output.lower() for error in crtc_errors)
     
     def setup_display(self, config: Dict[str, Any]) -> bool:
-        """Setup the display with the given configuration."""
+        """Setup the display with the given configuration, with fallback to 1920x1200 on CRTC error."""
         self.output_name = config['output']
-        self.mode_name = f"{config['width']}x{config['height']}_{config['refresh_rate']:.2f}"
+        original_width = config['width']
+        original_height = config['height']
+        refresh_rate = config['refresh_rate']
         
-        # Check if output is already in use
-        screens = DisplayManager.get_screens()
-        if self.output_name in screens and screens[self.output_name]['status'] == "connected":
-            print(f"Output {self.output_name} is already connected and in use")
-            return False
-        
-        # Create mode and setup display
-        if not DisplayManager.create_mode(config['width'], config['height'], config['refresh_rate']):
-            return False
+        def attempt_setup(width: int, height: int) -> Tuple[bool, str]:
+            """Helper function to attempt display setup with given resolution."""
+            mode_name = f"{width}x{height}_{refresh_rate:.2f}"
             
-        if not DisplayManager.setup_display(
-                self.mode_name, 
-                self.output_name, 
-                config['position'], 
-                config['relative_to']):
-            self.cleanup()
-            return False
+            # Clean up any existing mode first
+            DisplayManager.cleanup_display(self.output_name, mode_name)
+            
+            # Create new mode
+            if not DisplayManager.create_mode(width, height, refresh_rate):
+                return False, "Failed to create mode"
+            
+            # Add mode to output
+            if DisplayManager.run_command(f'xrandr --addmode {self.output_name} {mode_name}') is None:
+                return False, "Failed to add mode to output"
+            
+            # Try to set the mode
+            cmd = f'xrandr --output {self.output_name} --mode {mode_name} --{config["position"]} {config["relative_to"]}'
+            result = subprocess.run(cmd, shell=True, check=False,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  text=True)
+            
+            if result.returncode == 0:
+                self.mode_name = mode_name
+                self.cleanup_needed = True
+                print(f"Successfully set up display with resolution {width}x{height}")
+                return True, ""
+            else:
+                error_msg = result.stderr.strip()
+                print(f"Setup failed with resolution {width}x{height}: {error_msg}")
+                DisplayManager.cleanup_display(self.output_name, mode_name)
+                return False, error_msg
         
-        self.cleanup_needed = True
-        return True
+        # First try with original resolution
+        success, error_msg = attempt_setup(original_width, original_height)
+        if success:
+            return True
+        
+        # If failed with CRTC error, try fallback resolution
+        if self.is_crtc_error(error_msg):
+            print(f"CRTC error detected, trying fallback resolution {self.fallback_width}x{self.fallback_height}")
+            success, _ = attempt_setup(self.fallback_width, self.fallback_height)
+            if success:
+                # Update config with successful fallback resolution
+                config['width'] = self.fallback_width
+                config['height'] = self.fallback_height
+                return True
+        
+        return False
     
     def start_streaming(self, config: Dict[str, Any]) -> bool:
         """Start streaming with the given configuration."""
@@ -450,13 +469,31 @@ class ScreenManager:
     
     def setup_and_stream(self, config: Dict[str, Any]) -> bool:
         """Set up display and start streaming."""
+        # Create a temporary streamer to try and get client dimensions
+        temp_streamer = ScreenStreamer(config)
+        client_info = temp_streamer.wait_for_dimensions()
+        
+        if client_info:
+            width, height, client_ip = client_info
+            config['width'] = width
+            config['height'] = height
+            
+            # Update UDP target to use client's IP while keeping port
+            udp_parts = config['udp_target'].split(':')
+            port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
+            config['udp_target'] = f"udp://{client_ip}:{port}"
+            print(f"Updated UDP target to: {config['udp_target']}")
+        
         if not self.setup_display(config):
             return False
         
         # Give the display a moment to stabilize
         time.sleep(2)
         
-        return self.start_streaming(config)
+        # Create a new streamer with the updated config
+        self.streamer = ScreenStreamer(config)
+        # Skip dimension check since we already did it
+        return self.streamer.start(skip_dimension_check=True)
     
     def cleanup(self) -> None:
         """Clean up resources."""
@@ -477,9 +514,9 @@ def parse_arguments():
     
     # Display parameters
     display_group = parser.add_argument_group('Display Options')
-    display_group.add_argument("--width", type=int, default=1280, 
+    display_group.add_argument("--width", type=int, default=1920, 
                               help="Width of the display in pixels")
-    display_group.add_argument("--height", type=int, default=800, 
+    display_group.add_argument("--height", type=int, default=1080, 
                               help="Height of the display in pixels")
     display_group.add_argument("--refresh-rate", type=float, default=60.0, 
                               help="Refresh rate in Hz")
@@ -509,6 +546,8 @@ def parse_arguments():
                              help="Quantization parameter (0-51, lower is better quality)")
     stream_group.add_argument("--offset-x", type=int, help="Manual X offset for capture")
     stream_group.add_argument("--offset-y", type=int, help="Manual Y offset for capture")
+    stream_group.add_argument("--dimension-wait-time", type=float, default=5.0,
+                             help="Time to wait for client dimensions in seconds")
     
     # Operation modes
     mode_group = parser.add_argument_group('Mode Options')
@@ -525,11 +564,13 @@ def parse_arguments():
 
 
 def main():
+    """Main entry point for the program."""
     args = parse_arguments()
     config = vars(args)
     
     manager = ScreenManager()
     
+    # Handle Ctrl-C gracefully
     def signal_handler(sig, frame):
         print("\nStopping and cleaning up...")
         if not args.no_cleanup:
@@ -538,22 +579,7 @@ def main():
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Start control server
-    control_server = ControlServer()
-    control_server.start()
-    print("Control server started on port 5000. Waiting for client connection...")
-    
     try:
-        # Wait for client configuration
-        client_config = None
-        while not client_config:
-            print("Waiting for client to connect...")
-            client_config = control_server.wait_for_client_config()
-            time.sleep(1)
-        
-        # Merge client config with command line args
-        config.update(client_config)
-        
         if args.setup_only:
             if not manager.setup_display(config):
                 sys.exit(1)
@@ -582,7 +608,7 @@ def main():
     finally:
         if not args.no_cleanup:
             manager.cleanup()
-        control_server.stop()
+
 
 if __name__ == "__main__":
     main()
