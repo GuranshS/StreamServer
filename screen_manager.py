@@ -7,38 +7,141 @@ over UDP with low latency using FFmpeg.
 """
 
 import argparse
+import dataclasses
+import enum
+import logging
 import signal
+import socket
 import subprocess
 import sys
 import time
-from typing import Dict, Any, Optional, Tuple
-import socket
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("screen_manager")
+
+
+class ScreenManagerError(Exception):
+    """Base exception for Screen Manager errors."""
+    pass
+
+
+class DisplayError(ScreenManagerError):
+    """Exception for display-related errors."""
+    pass
+
+
+class StreamError(ScreenManagerError):
+    """Exception for streaming-related errors."""
+    pass
+
+
+class CommandError(ScreenManagerError):
+    """Exception for command execution errors."""
+    pass
+
+
+class Position(enum.Enum):
+    """Valid positions for display placement."""
+    LEFT_OF = "left-of"
+    RIGHT_OF = "right-of"
+    ABOVE = "above"
+    BELOW = "below"
+
+
+@dataclass
+class DisplayConfig:
+    """Configuration for display setup."""
+    width: int
+    height: int
+    refresh_rate: float
+    output: str
+    position: Position
+    relative_to: str
+
+
+@dataclass
+class StreamConfig:
+    """Configuration for streaming."""
+    width: int
+    height: int
+    framerate: int
+    output: str
+    udp_target: str
+    bitrate: str
+    preset: str
+    tune: str
+    qp: int
+    offset_x: Optional[int] = None
+    offset_y: Optional[int] = None
+    dimension_wait_time: float = 5.0
+
+
+@dataclass
+class ScreenInfo:
+    """Information about a screen."""
+    name: str
+    status: str
+    modes: List[str]
+    current_mode: Optional[str] = None
+    position: Optional[Position] = None
+    primary: bool = False
+    geometry: Optional[Tuple[int, int, int, int]] = None  # width, height, x, y
+
+
+class CommandRunner:
+    """Handles execution of shell commands."""
+    
+    @staticmethod
+    def run(cmd: str, check: bool = True) -> Tuple[int, str, str]:
+        """
+        Execute a shell command and return its output.
+        
+        Args:
+            cmd: Command to execute
+            check: Whether to raise exception on non-zero exit code
+            
+        Returns:
+            Tuple of (return_code, stdout, stderr)
+            
+        Raises:
+            CommandError: If command fails and check is True
+        """
+        logger.debug(f"Running command: {cmd}")
+        try:
+            result = subprocess.run(
+                cmd, 
+                shell=True,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if check and result.returncode != 0:
+                raise CommandError(f"Command failed with code {result.returncode}: {result.stderr}")
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.SubprocessError as e:
+            raise CommandError(f"Failed to execute command: {cmd}") from e
 
 
 class DisplayManager:
     """Manages virtual displays using xrandr."""
     
     @staticmethod
-    def run_command(cmd: str, check: bool = True) -> Optional[str]:
-        """Execute a shell command and return its output."""
-        try:
-            result = subprocess.run(cmd, shell=True, check=check,
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE,
-                                   text=True)
-            return result.stdout
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing command: {cmd}")
-            print(e.stderr)
-            return None
-    
-    @staticmethod
-    def get_screens() -> Dict[str, Any]:
-        """Get information about currently connected screens."""
-        output = DisplayManager.run_command("xrandr")
-        if not output:
-            return {}
+    def get_screens() -> Dict[str, ScreenInfo]:
+        """
+        Get information about currently connected screens.
         
+        Returns:
+            Dictionary of screen names to ScreenInfo objects
+        """
+        _, output, _ = CommandRunner.run("xrandr")
         screens = {}
         current_screen = None
         
@@ -47,265 +150,247 @@ class DisplayManager:
                 parts = line.split()
                 screen_name = parts[0]
                 status = parts[1]
-                screens[screen_name] = {
-                    'status': status,
-                    'modes': [],
-                    'current_mode': None,
-                    'position': None
-                }
+                screen_info = ScreenInfo(
+                    name=screen_name,
+                    status=status,
+                    modes=[],
+                    primary="primary" in parts
+                )
+                screens[screen_name] = screen_info
                 current_screen = screen_name
                 
-                if len(parts) > 3 and parts[2] == "primary":
-                    screens[screen_name]['primary'] = True
-                    screens[screen_name]['current_mode'] = parts[3]
-                elif len(parts) > 2 and "x" in parts[2]:
-                    screens[screen_name]['current_mode'] = parts[2]
-                
+                # Parse geometry and current mode
                 for part in parts:
-                    if part in ["left-of", "right-of", "above", "below"]:
-                        screens[screen_name]['position'] = part
+                    if "x" in part and "+" in part:
+                        # Format: 1920x1080+0+0
+                        dims = part.replace('+', 'x').split('x')
+                        if len(dims) >= 4:
+                            width = int(dims[0])
+                            height = int(dims[1])
+                            x_pos = int(dims[2])
+                            y_pos = int(dims[3])
+                            screen_info.geometry = (width, height, x_pos, y_pos)
+                            screen_info.current_mode = f"{width}x{height}"
+                
+                # Parse position
+                for i, part in enumerate(parts):
+                    if part in [pos.value for pos in Position]:
+                        screen_info.position = Position(part)
                         
-            elif current_screen and "x" in line:
+            elif current_screen and line.strip() and "x" in line:
                 mode = line.strip().split()[0]
-                screens[current_screen]['modes'].append(mode)
+                screens[current_screen].modes.append(mode)
         
         return screens
     
     @staticmethod
-    def create_mode(width: int, height: int, refresh_rate: float) -> Optional[str]:
-        """Create a new display mode."""
-        mode_name = f"{width}x{height}_{refresh_rate:.2f}"
+    def create_mode(config: DisplayConfig) -> str:
+        """
+        Create a new display mode.
+        
+        Args:
+            config: Display configuration
+            
+        Returns:
+            Mode name
+            
+        Raises:
+            DisplayError: If mode creation fails
+        """
+        mode_name = f"{config.width}x{config.height}_{config.refresh_rate:.2f}"
         
         # Check if mode already exists
-        output = DisplayManager.run_command("xrandr")
-        if output and mode_name in output:
-            print(f"Mode {mode_name} already exists.")
+        _, output, _ = CommandRunner.run("xrandr")
+        if mode_name in output:
+            logger.info(f"Mode {mode_name} already exists")
             return mode_name
         
         # Generate modeline with cvt
-        cvt_output = DisplayManager.run_command(f"cvt {width} {height} {refresh_rate}")
-        if not cvt_output:
-            print("Failed to generate modeline")
-            return None
-        
-        # Extract modeline
-        modeline = None
-        for line in cvt_output.splitlines():
-            if line.startswith('Modeline'):
-                modeline = line.split('Modeline')[1].strip().split('"')[2].strip()
-                break
-        
-        if not modeline:
-            print("Could not extract modeline from cvt output")
-            return None
-        
-        # Create new mode
-        if DisplayManager.run_command(f'xrandr --newmode "{mode_name}" {modeline}') is None:
-            return None
-        
-        print(f"Created new mode: {mode_name}")
-        return mode_name
+        try:
+            _, cvt_output, _ = CommandRunner.run(
+                f"cvt {config.width} {config.height} {config.refresh_rate}"
+            )
+            
+            # Extract modeline
+            modeline = None
+            for line in cvt_output.splitlines():
+                if line.startswith('Modeline'):
+                    modeline = line.split('Modeline')[1].strip().split('"')[2].strip()
+                    break
+            
+            if not modeline:
+                raise DisplayError("Could not extract modeline from cvt output")
+            
+            # Create new mode
+            CommandRunner.run(f'xrandr --newmode "{mode_name}" {modeline}')
+            logger.info(f"Created new mode: {mode_name}")
+            return mode_name
+            
+        except CommandError as e:
+            raise DisplayError(f"Failed to create display mode: {e}") from e
     
     @staticmethod
-    def setup_display(mode_name: str, 
-                      output_name: str, 
-                      position: str, 
-                      relative_to: str) -> bool:
-        """Set up a display with the specified mode and position."""
-        # Add mode to output
-        if DisplayManager.run_command(f'xrandr --addmode {output_name} {mode_name}') is None:
-            return False
+    def setup_display(config: DisplayConfig, mode_name: str) -> bool:
+        """
+        Set up a display with the specified mode and position.
         
-        # Position the screen
-        cmd = f'xrandr --output {output_name} --mode {mode_name} --{position} {relative_to}'
-        if DisplayManager.run_command(cmd) is None:
-            return False
-        
-        print(f"Successfully set up {output_name} with mode {mode_name} {position} {relative_to}")
-        return True
+        Args:
+            config: Display configuration
+            mode_name: Name of the mode to use
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            DisplayError: If display setup fails
+        """
+        try:
+            # Add mode to output
+            CommandRunner.run(f'xrandr --addmode {config.output} {mode_name}')
+            
+            # Position the screen
+            cmd = f'xrandr --output {config.output} --mode {mode_name} --{config.position.value} {config.relative_to}'
+            CommandRunner.run(cmd)
+            
+            logger.info(f"Successfully set up {config.output} with mode {mode_name} {config.position.value} {config.relative_to}")
+            return True
+            
+        except CommandError as e:
+            raise DisplayError(f"Failed to setup display: {e}") from e
     
     @staticmethod
     def cleanup_display(output_name: str, mode_name: Optional[str] = None) -> None:
-        """Clean up by turning off the output and optionally deleting the mode."""
-        if mode_name:
-            DisplayManager.run_command(f'xrandr --delmode {output_name} {mode_name}', check=False)
-            DisplayManager.run_command(f'xrandr --rmmode {mode_name}', check=False)
+        """
+        Clean up by turning off the output and optionally deleting the mode.
         
-        DisplayManager.run_command(f'xrandr --output {output_name} --off', check=False)
-        print("Display cleanup complete")
+        Args:
+            output_name: Name of the output to clean up
+            mode_name: Name of the mode to delete (optional)
+        """
+        try:
+            if mode_name:
+                # Best effort to remove mode from output
+                CommandRunner.run(f'xrandr --delmode {output_name} {mode_name}', check=False)
+                CommandRunner.run(f'xrandr --rmmode {mode_name}', check=False)
+            
+            # Turn off output
+            CommandRunner.run(f'xrandr --output {output_name} --off', check=False)
+            logger.info("Display cleanup complete")
+            
+        except CommandError as e:
+            logger.warning(f"Error during display cleanup: {e}")
 
 
 class ScreenStreamer:
     """Handles streaming screen content over UDP using FFmpeg."""
     
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize streamer with configuration parameters."""
-        self.width = config['width']
-        self.height = config['height']
-        self.framerate = config['framerate']
-        self.output = config['output']
-        self.udp_target = config['udp_target']
-        self.bitrate = config['bitrate']
-        self.preset = config['preset']
-        self.tune = config['tune']
-        self.qp = config['qp']
+    def __init__(self, config: StreamConfig):
+        """
+        Initialize streamer with configuration parameters.
+        
+        Args:
+            config: Streaming configuration
+        """
+        self.config = config
         self.process = None
-        # Add explicit offset parameters with defaults
-        self.offset_x = config.get('offset_x', None)
-        self.offset_y = config.get('offset_y', None)
-        # Add wait time for client dimensions
-        self.dimension_wait_time = config.get('dimension_wait_time', 10.0)  # Default to 10 seconds
     
     def get_display_position(self) -> Tuple[int, int]:
-        """Get the position of the specified output."""
+        """
+        Get the position of the specified output.
+        
+        Returns:
+            Tuple of (x, y) position
+        """
         try:
-            # First try with xrandr --verbose to get detailed geometry info
-            print(f"DEBUG: Trying to find position of display: {self.output}")
-            output = subprocess.check_output(["xrandr", "--verbose"], text=True)
-            lines = output.splitlines()
+            screens = DisplayManager.get_screens()
             
-            # Extract and print info about all displays for debugging
-            print("DEBUG: Connected displays:")
-            for line in lines:
-                if "connected" in line:
-                    print(f"  {line}")
+            if self.config.output in screens and screens[self.config.output].geometry:
+                _, _, x_pos, y_pos = screens[self.config.output].geometry
+                logger.debug(f"Found display position: x={x_pos}, y={y_pos}")
+                return x_pos, y_pos
             
-            # Print geometry info
-            print("DEBUG: Display geometry info:")
-            for line in lines:
-                if "geometry" in line:
-                    print(f"  {line}")
+            # If geometry not found, try to infer from relative position
+            primary_screen = None
+            for screen in screens.values():
+                if screen.primary and screen.geometry:
+                    primary_screen = screen
+                    break
             
-            # Find the specified output
-            output_found = False
-            for i, line in enumerate(lines):
-                if self.output in line and "connected" in line:
-                    output_found = True
-                    print(f"DEBUG: Found output {self.output} at line {i}")
-                    # Look for the geometry line which contains position information
-                    for j in range(i, min(i + 20, len(lines))):
-                        if "geometry" in lines[j]:
-                            geo_line = lines[j].strip()
-                            print(f"DEBUG: Found geometry line: {geo_line}")
-                            # Parse the geometry line, format is something like:
-                            # geometry: 1280x800+1920+0
-                            geo_parts = geo_line.split()
-                            if len(geo_parts) >= 2 and "+" in geo_parts[1]:
-                                coords = geo_parts[1].split("+")
-                                if len(coords) >= 3:
-                                    x_pos, y_pos = int(coords[1]), int(coords[2])
-                                    print(f"DEBUG: Detected position: x={x_pos}, y={y_pos}")
-                                    return x_pos, y_pos
-            
-            # Try alternative method: parse xrandr output for position
-            print("DEBUG: Trying alternative method...")
-            output = subprocess.check_output(["xrandr"], text=True)
-            lines = output.splitlines()
-            
-            screens = {}
-            primary_x, primary_y = 0, 0
-            primary_width, primary_height = 0, 0
-            
-            # Find primary screen position and dimensions
-            for line in lines:
-                if "connected" in line and "primary" in line:
-                    parts = line.split()
-                    for part in parts:
-                        if "x" in part and "+" in part:
-                            # Format: 1920x1080+0+0
-                            dims = part.replace('+', 'x').split('x')
-                            if len(dims) >= 4:
-                                primary_width = int(dims[0])
-                                primary_height = int(dims[1])
-                                primary_x = int(dims[2])
-                                primary_y = int(dims[3])
-                                print(f"DEBUG: Primary screen: {primary_width}x{primary_height} at +{primary_x}+{primary_y}")
-            
-            # Find target screen position
-            for line in lines:
-                if self.output in line and "connected" in line:
-                    parts = line.split()
-                    for part in parts:
-                        if "x" in part and "+" in part:
-                            # Format: 1280x800+1920+0
-                            dims = part.replace('+', 'x').split('x')
-                            if len(dims) >= 4:
-                                x_pos = int(dims[2])
-                                y_pos = int(dims[3])
-                                print(f"DEBUG: Target display: {self.output} at +{x_pos}+{y_pos}")
-                                return x_pos, y_pos
-            
-            # Fallback: Use relative position logic
-            if output_found:
-                print(f"DEBUG: Using fallback position logic...")
-                screens = DisplayManager.get_screens()
+            if primary_screen and self.config.output in screens:
+                screen = screens[self.config.output]
+                primary_width, primary_height, primary_x, primary_y = primary_screen.geometry
                 
-                if self.output in screens:
-                    position = screens[self.output].get('position')
-                    print(f"DEBUG: Display {self.output} position: {position}")
-                    
-                    if position == "right-of":
-                        return primary_width, 0
-                    elif position == "left-of":
-                        return 0, 0  # Assuming primary is not at 0,0
-                    elif position == "above":
-                        return 0, 0
-                    elif position == "below":
-                        return 0, primary_height
+                if screen.position == Position.RIGHT_OF:
+                    return primary_x + primary_width, primary_y
+                elif screen.position == Position.LEFT_OF:
+                    return primary_x - screen.geometry[0] if screen.geometry else 0, primary_y
+                elif screen.position == Position.ABOVE:
+                    return primary_x, primary_y - screen.geometry[1] if screen.geometry else 0
+                elif screen.position == Position.BELOW:
+                    return primary_x, primary_y + primary_height
             
-            print("WARNING: Could not determine display position automatically")
-            print("DEBUG: Please specify position with --offset-x and --offset-y")
-            return 0, 0  # Default if position not found
+            logger.warning("Could not determine display position automatically")
+            return 0, 0
             
-        except subprocess.CalledProcessError as e:
-            print(f"Error getting display position: {e}")
+        except Exception as e:
+            logger.error(f"Error getting display position: {e}")
             return 0, 0
     
-    def build_ffmpeg_command(self) -> str:
-        """Build the ffmpeg command for screen capture and streaming."""
+    def build_ffmpeg_command(self) -> List[str]:
+        """
+        Build the ffmpeg command for screen capture and streaming.
+        
+        Returns:
+            List of command parts
+        """
         # Use explicit offsets if provided, otherwise try to detect them
-        if self.offset_x is not None and self.offset_y is not None:
-            offset_x, offset_y = self.offset_x, self.offset_y
-            print(f"Using explicitly provided offsets: x={offset_x}, y={offset_y}")
+        if self.config.offset_x is not None and self.config.offset_y is not None:
+            offset_x, offset_y = self.config.offset_x, self.config.offset_y
+            logger.info(f"Using explicitly provided offsets: x={offset_x}, y={offset_y}")
         else:
             offset_x, offset_y = self.get_display_position()
         
-        cmd = [
+        bufsize = f"{int(float(self.config.bitrate[:-1]) * 0.5)}{self.config.bitrate[-1]}"
+        
+        return [
             "ffmpeg",
             "-f", "x11grab",
-            "-video_size", f"{self.width}x{self.height}",
-            "-framerate", str(self.framerate),
+            "-video_size", f"{self.config.width}x{self.config.height}",
+            "-framerate", str(self.config.framerate),
             "-i", f":0.0+{offset_x},{offset_y}",
             "-c:v", "libx264",
-            "-preset", self.preset,
-            "-tune", self.tune,
-            "-qp", str(self.qp),
-            "-b:v", self.bitrate,
-            "-maxrate", self.bitrate,
-            "-bufsize", f"{int(float(self.bitrate[:-1]) * 0.5)}{self.bitrate[-1]}",
-            "-g", str(self.framerate),
+            "-preset", self.config.preset,
+            "-tune", self.config.tune,
+            "-qp", str(self.config.qp),
+            "-b:v", self.config.bitrate,
+            "-maxrate", self.config.bitrate,
+            "-bufsize", bufsize,
+            "-g", str(self.config.framerate),
             "-profile:v", "baseline",
             "-pix_fmt", "yuv420p",
             "-f", "mpegts",
-            self.udp_target
+            self.config.udp_target
         ]
-        
-        return " ".join(cmd)
    
-    def wait_for_dimensions(self) -> Optional[Tuple[int, int, str]]:
-        """Wait briefly for client dimensions packet and return width, height, and client IP."""
+    def wait_for_client_dimensions(self) -> Optional[Tuple[int, int, str]]:
+        """
+        Wait briefly for client dimensions packet and return width, height, and client IP.
+        
+        Returns:
+            Tuple of (width, height, client_ip) if received, None otherwise
+        """
         try:
             # Extract port from UDP target
-            target_parts = self.udp_target.split(':')
+            target_parts = self.config.udp_target.split(':')
             if len(target_parts) >= 3:
                 port = int(target_parts[2])
                 
-                # Create a socket to listen briefly for dimensions
+                # Create a socket to listen for dimensions
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.bind(('0.0.0.0', port))
-                sock.settimeout(self.dimension_wait_time)  # Use configurable wait time
+                sock.settimeout(self.config.dimension_wait_time)
                 
-                print(f"Waiting for client dimensions on port {port} for {self.dimension_wait_time} seconds...")
+                logger.info(f"Waiting for client dimensions on port {port} for {self.config.dimension_wait_time} seconds...")
                 data, addr = sock.recvfrom(1024)
                 message = data.decode('utf-8')
                 
@@ -322,64 +407,82 @@ class ScreenStreamer:
                         if len(parts) >= 4 and parts[3]:
                             client_ip = parts[3]
                         
-                        print(f"Received client dimensions: {width}x{height} from {client_ip}")
+                        logger.info(f"Received client dimensions: {width}x{height} from {client_ip}")
                         sock.close()
                         return width, height, client_ip
                 
                 sock.close()
+                
+        except socket.timeout:
+            logger.info("No client dimensions received within timeout period")
         except Exception as e:
-            print(f"Error receiving dimensions: {e}")
+            logger.error(f"Error receiving dimensions: {e}")
         
-        print("Using default dimensions and target")
+        logger.info("Using default dimensions and target")
         return None
 
     def start(self, skip_dimension_check=False) -> bool:
-        """Start the streaming process."""
-        # Listen for client dimensions first if not skipping dimension check
-        if not skip_dimension_check:
-            client_info = self.wait_for_dimensions()
-            if client_info:
-                width, height, client_ip = client_info
-                self.width = width
-                self.height = height
-                
-                # Update UDP target to use client's IP while keeping port
-                udp_parts = self.udp_target.split(':')
-                port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
-                self.udp_target = f"udp://{client_ip}:{port}"
-                print(f"Updated stream dimensions to client size: {width}x{height}")
-                print(f"Updated UDP target to: {self.udp_target}")
+        """
+        Start the streaming process.
         
-        cmd = self.build_ffmpeg_command()
-        print(f"Starting stream with command:\n{cmd}")
-        
+        Args:
+            skip_dimension_check: Whether to skip waiting for client dimensions
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            StreamError: If streaming fails to start
+        """
         try:
+            # Listen for client dimensions first if not skipping dimension check
+            if not skip_dimension_check:
+                client_info = self.wait_for_client_dimensions()
+                if client_info:
+                    width, height, client_ip = client_info
+                    self.config.width = width
+                    self.config.height = height
+                    
+                    # Update UDP target to use client's IP while keeping port
+                    udp_parts = self.config.udp_target.split(':')
+                    port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
+                    self.config.udp_target = f"udp://{client_ip}:{port}"
+                    logger.info(f"Updated stream dimensions to client size: {width}x{height}")
+                    logger.info(f"Updated UDP target to: {self.config.udp_target}")
+            
+            cmd = self.build_ffmpeg_command()
+            cmd_str = " ".join(cmd)
+            logger.info(f"Starting stream with command:\n{cmd_str}")
+            
             self.process = subprocess.Popen(
                 cmd,
-                shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True
             )
+            
             time.sleep(1)
             if self.process.poll() is not None:
-                print("Failed to start ffmpeg:")
-                print(self.process.stderr.read())
-                return False
+                stderr_output = self.process.stderr.read()
+                raise StreamError(f"Failed to start ffmpeg: {stderr_output}")
+                
             return True
+            
         except Exception as e:
-            print(f"Error starting ffmpeg: {e}")
-            return False
+            raise StreamError(f"Error starting stream: {e}")
     
     def stop(self) -> None:
         """Stop the streaming process."""
         if self.process and self.process.poll() is None:
-            self.process.terminate()
             try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-            print("Streaming stopped")
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                logger.info("Streaming stopped")
+            except Exception as e:
+                logger.error(f"Error stopping stream: {e}")
 
 
 class ScreenManager:
@@ -391,11 +494,19 @@ class ScreenManager:
         self.output_name = None
         self.mode_name = None
         self.cleanup_needed = False
-        self.fallback_width = 1920  # Fallback resolution values
+        self.fallback_width = 1920
         self.fallback_height = 1200
     
     def is_crtc_error(self, error_output: str) -> bool:
-        """Check if the error output contains a CRTC error."""
+        """
+        Check if the error output contains a CRTC error.
+        
+        Args:
+            error_output: Error message to check
+            
+        Returns:
+            True if contains CRTC error
+        """
         crtc_errors = [
             "CRTC",
             "crtc",
@@ -405,43 +516,61 @@ class ScreenManager:
         ]
         return any(error.lower() in error_output.lower() for error in crtc_errors)
     
-    def setup_display(self, config: Dict[str, Any]) -> bool:
-        """Setup the display with the given configuration, with fallback to 1920x1200 on CRTC error."""
-        self.output_name = config['output']
-        original_width = config['width']
-        original_height = config['height']
-        refresh_rate = config['refresh_rate']
+    def setup_display(self, config: Union[DisplayConfig, Dict]) -> bool:
+        """
+        Setup the display with the given configuration, with fallback to 1920x1200 on CRTC error.
+        
+        Args:
+            config: Display configuration
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            DisplayError: If display setup fails
+        """
+        # Convert dict to DisplayConfig if needed
+        if isinstance(config, dict):
+            display_config = DisplayConfig(
+                width=config['width'],
+                height=config['height'],
+                refresh_rate=config['refresh_rate'],
+                output=config['output'],
+                position=Position(config['position']),
+                relative_to=config['relative_to']
+            )
+        else:
+            display_config = config
+        
+        self.output_name = display_config.output
+        original_width = display_config.width
+        original_height = display_config.height
         
         def attempt_setup(width: int, height: int) -> Tuple[bool, str]:
             """Helper function to attempt display setup with given resolution."""
-            mode_name = f"{width}x{height}_{refresh_rate:.2f}"
-            
-            # Clean up any existing mode first
-            DisplayManager.cleanup_display(self.output_name, mode_name)
-            
-            # Create new mode
-            if not DisplayManager.create_mode(width, height, refresh_rate):
-                return False, "Failed to create mode"
-            
-            # Add mode to output
-            if DisplayManager.run_command(f'xrandr --addmode {self.output_name} {mode_name}') is None:
-                return False, "Failed to add mode to output"
-            
-            # Try to set the mode
-            cmd = f'xrandr --output {self.output_name} --mode {mode_name} --{config["position"]} {config["relative_to"]}'
-            result = subprocess.run(cmd, shell=True, check=False,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  text=True)
-            
-            if result.returncode == 0:
+            try:
+                # Update config with new dimensions
+                display_config.width = width
+                display_config.height = height
+                
+                # Clean up any existing mode first
+                mode_name = f"{width}x{height}_{display_config.refresh_rate:.2f}"
+                DisplayManager.cleanup_display(self.output_name, mode_name)
+                
+                # Create new mode
+                mode_name = DisplayManager.create_mode(display_config)
+                
+                # Set up display with the mode
+                DisplayManager.setup_display(display_config, mode_name)
+                
                 self.mode_name = mode_name
                 self.cleanup_needed = True
-                print(f"Successfully set up display with resolution {width}x{height}")
+                logger.info(f"Successfully set up display with resolution {width}x{height}")
                 return True, ""
-            else:
-                error_msg = result.stderr.strip()
-                print(f"Setup failed with resolution {width}x{height}: {error_msg}")
+                
+            except DisplayError as e:
+                error_msg = str(e)
+                logger.warning(f"Setup failed with resolution {width}x{height}: {error_msg}")
                 DisplayManager.cleanup_display(self.output_name, mode_name)
                 return False, error_msg
         
@@ -452,48 +581,139 @@ class ScreenManager:
         
         # If failed with CRTC error, try fallback resolution
         if self.is_crtc_error(error_msg):
-            print(f"CRTC error detected, trying fallback resolution {self.fallback_width}x{self.fallback_height}")
+            logger.info(f"CRTC error detected, trying fallback resolution {self.fallback_width}x{self.fallback_height}")
             success, _ = attempt_setup(self.fallback_width, self.fallback_height)
             if success:
-                # Update config with successful fallback resolution
-                config['width'] = self.fallback_width
-                config['height'] = self.fallback_height
+                # If we succeeded with fallback, update the original config
+                if isinstance(config, dict):
+                    config['width'] = self.fallback_width
+                    config['height'] = self.fallback_height
                 return True
         
         return False
     
-    def start_streaming(self, config: Dict[str, Any]) -> bool:
-        """Start streaming with the given configuration."""
-        self.streamer = ScreenStreamer(config)
+    def start_streaming(self, config: Union[StreamConfig, Dict]) -> bool:
+        """
+        Start streaming with the given configuration.
+        
+        Args:
+            config: Streaming configuration
+            
+        Returns:
+            True if successful
+            
+        Raises:
+            StreamError: If streaming fails to start
+        """
+        # Convert dict to StreamConfig if needed
+        if isinstance(config, dict):
+            stream_config = StreamConfig(
+                width=config['width'],
+                height=config['height'],
+                framerate=config['framerate'],
+                output=config['output'],
+                udp_target=config['udp_target'],
+                bitrate=config['bitrate'],
+                preset=config['preset'],
+                tune=config['tune'],
+                qp=config['qp'],
+                offset_x=config.get('offset_x'),
+                offset_y=config.get('offset_y'),
+                dimension_wait_time=config.get('dimension_wait_time', 5.0)
+            )
+        else:
+            stream_config = config
+        
+        self.streamer = ScreenStreamer(stream_config)
         return self.streamer.start()
     
-    def setup_and_stream(self, config: Dict[str, Any]) -> bool:
-        """Set up display and start streaming."""
-        # Create a temporary streamer to try and get client dimensions
-        temp_streamer = ScreenStreamer(config)
-        client_info = temp_streamer.wait_for_dimensions()
+    def setup_and_stream(self, config: Dict) -> bool:
+        """
+        Set up display and start streaming.
         
-        if client_info:
-            width, height, client_ip = client_info
-            config['width'] = width
-            config['height'] = height
+        Args:
+            config: Combined configuration
             
-            # Update UDP target to use client's IP while keeping port
-            udp_parts = config['udp_target'].split(':')
-            port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
-            config['udp_target'] = f"udp://{client_ip}:{port}"
-            print(f"Updated UDP target to: {config['udp_target']}")
-        
-        if not self.setup_display(config):
+        Returns:
+            True if successful
+        """
+        try:
+            # Create a temporary streamer to try and get client dimensions
+            stream_config = StreamConfig(
+                width=config['width'],
+                height=config['height'],
+                framerate=config['framerate'],
+                output=config['output'],
+                udp_target=config['udp_target'],
+                bitrate=config['bitrate'],
+                preset=config['preset'],
+                tune=config['tune'],
+                qp=config['qp'],
+                offset_x=config.get('offset_x'),
+                offset_y=config.get('offset_y'),
+                dimension_wait_time=config.get('dimension_wait_time', 5.0)
+            )
+            
+            temp_streamer = ScreenStreamer(stream_config)
+            client_info = temp_streamer.wait_for_client_dimensions()
+            
+            if client_info:
+                width, height, client_ip = client_info
+                config['width'] = width
+                config['height'] = height
+                
+                # Update UDP target to use client's IP while keeping port
+                udp_parts = config['udp_target'].split(':')
+                port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
+                config['udp_target'] = f"udp://{client_ip}:{port}"
+                logger.info(f"Updated UDP target to: {config['udp_target']}")
+            
+            # Set up display
+            display_config = DisplayConfig(
+                width=config['width'],
+                height=config['height'],
+                refresh_rate=config['refresh_rate'],
+                output=config['output'],
+                position=Position(config['position']),
+                relative_to=config['relative_to']
+            )
+            
+            if not self.setup_display(display_config):
+                return False
+            
+            # Give the display a moment to stabilize
+            time.sleep(2)
+            
+            # IMPORTANT: Update config with the actual dimensions after setup
+            # This ensures we're using the fallback resolution if it was applied
+            if self.fallback_width != config['width'] or self.fallback_height != config['height']:
+                logger.info(f"Updating stream dimensions to match fallback resolution: {self.fallback_width}x{self.fallback_height}")
+                config['width'] = self.fallback_width
+                config['height'] = self.fallback_height
+            
+            # Create a new streamer with the updated config
+            stream_config = StreamConfig(
+                width=config['width'],
+                height=config['height'],
+                framerate=config['framerate'],
+                output=config['output'],
+                udp_target=config['udp_target'],
+                bitrate=config['bitrate'],
+                preset=config['preset'],
+                tune=config['tune'],
+                qp=config['qp'],
+                offset_x=config.get('offset_x'),
+                offset_y=config.get('offset_y'),
+                dimension_wait_time=config.get('dimension_wait_time', 5.0)
+            )
+            
+            self.streamer = ScreenStreamer(stream_config)
+            # Skip dimension check since we already did it
+            return self.streamer.start(skip_dimension_check=True)
+            
+        except Exception as e:
+            logger.error(f"Error in setup and stream: {e}")
             return False
-        
-        # Give the display a moment to stabilize
-        time.sleep(2)
-        
-        # Create a new streamer with the updated config
-        self.streamer = ScreenStreamer(config)
-        # Skip dimension check since we already did it
-        return self.streamer.start(skip_dimension_check=True)
     
     def cleanup(self) -> None:
         """Clean up resources."""
@@ -525,7 +745,7 @@ def parse_arguments():
     display_group.add_argument("--relative-to", default="eDP-1",
                               help="Primary screen to position relative to")
     display_group.add_argument("--position", default="left-of",
-                              choices=["left-of", "right-of", "above", "below"],
+                              choices=[p.value for p in Position],
                               help="Position relative to primary screen")
     
     # Streaming parameters
@@ -568,11 +788,16 @@ def main():
     args = parse_arguments()
     config = vars(args)
     
+    # Configure logging based on debug flag
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+    
     manager = ScreenManager()
     
     # Handle Ctrl-C gracefully
     def signal_handler(sig, frame):
-        print("\nStopping and cleaning up...")
+        logger.info("Stopping and cleaning up...")
         if not args.no_cleanup:
             manager.cleanup()
         sys.exit(0)
@@ -582,29 +807,35 @@ def main():
     try:
         if args.setup_only:
             if not manager.setup_display(config):
+                logger.error("Display setup failed")
                 sys.exit(1)
-            print("Display setup complete. Press Ctrl+C to clean up...")
+            logger.info("Display setup complete. Press Ctrl+C to clean up...")
             
         elif args.stream_only:
             if not manager.start_streaming(config):
+                logger.error("Stream start failed")
                 sys.exit(1)
-            print("Streaming started. Press Ctrl+C to stop...")
+            logger.info("Streaming started. Press Ctrl+C to stop...")
             
         else:
             if not manager.setup_and_stream(config):
+                logger.error("Display setup and/or streaming failed")
                 sys.exit(1)
-            print("Display setup and streaming started. Press Ctrl+C to stop...")
+            logger.info("Display setup and streaming started. Press Ctrl+C to stop...")
         
         # Main loop
         while True:
             time.sleep(1)
             if (manager.streamer and manager.streamer.process and 
                 manager.streamer.process.poll() is not None):
-                print("Streaming process ended unexpectedly")
+                logger.error("Streaming process ended unexpectedly")
                 break
                 
     except KeyboardInterrupt:
-        print("\nOperation interrupted by user")
+        logger.info("Operation interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         if not args.no_cleanup:
             manager.cleanup()
