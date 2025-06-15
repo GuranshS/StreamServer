@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 import enum
 import logging
+import os
 import signal
 import socket
 import subprocess
@@ -293,6 +294,8 @@ class ScreenStreamer:
         """
         self.config = config
         self.process = None
+        self.terminal_process = None
+        self.ffmpeg_pid = None
     
     def get_display_position(self) -> Tuple[int, int]:
         """
@@ -350,7 +353,11 @@ class ScreenStreamer:
         else:
             offset_x, offset_y = self.get_display_position()
         
-        bufsize = f"{int(float(self.config.bitrate[:-1]) * 0.5)}{self.config.bitrate[-1]}"
+        # Calculate buffer size (should be at least equal to bitrate, often 2x)
+        bitrate_value = float(self.config.bitrate[:-1])
+        bitrate_unit = self.config.bitrate[-1]
+        bufsize_value = max(bitrate_value * 2, bitrate_value)  # At least 2x bitrate
+        bufsize = f"{int(bufsize_value)}{bitrate_unit}"
         
         return [
             "ffmpeg",
@@ -371,7 +378,247 @@ class ScreenStreamer:
             "-f", "mpegts",
             self.config.udp_target
         ]
-   
+    
+    def detect_terminal_emulator(self) -> Optional[Tuple[List[str], str, Optional[str]]]:
+        """
+        Detect available terminal emulator and return command to launch it.
+        
+        Returns:
+            Tuple of (terminal_cmd, exec_flag, title_flag) or None if none found
+        """
+        # Optimized for Linux Mint (Cinnamon desktop)
+        terminals = [
+            # Terminal command, execute flag, title flag (if supported)
+            (["gnome-terminal"], "--", "--title"),
+            (["x-terminal-emulator"], "-e", None),  # Debian/Ubuntu default
+            (["mate-terminal"], "-e", "--title"),
+            (["xfce4-terminal"], "-e", "--title"),
+            (["konsole"], "-e", "--title"),
+            (["terminator"], "-e", "--title"),
+            (["tilix"], "-e", "--title"),
+            (["alacritty"], "-e", "--title"),
+            (["kitty"], "-e", "--title"),
+            (["xterm"], "-e", "-title"),
+            (["urxvt"], "-e", "-title"),
+            (["st"], "-e", "-t"),
+        ]
+        
+        for terminal_cmd, exec_flag, title_flag in terminals:
+            try:
+                # Check if terminal is available
+                result = subprocess.run(
+                    ["which", terminal_cmd[0]], 
+                    capture_output=True, 
+                    text=True
+                )
+                if result.returncode == 0:
+                    logger.info(f"Found terminal emulator: {terminal_cmd[0]}")
+                    return terminal_cmd, exec_flag, title_flag
+            except Exception:
+                continue
+        
+        logger.warning("No suitable terminal emulator found")
+        return None
+    
+    def launch_in_terminal(self, use_terminal: bool = True) -> bool:
+        """
+        Launch FFmpeg in a new terminal or as a detached process.
+        
+        Args:
+            use_terminal: Whether to launch in a new terminal window
+            
+        Returns:
+            True if successful
+        """
+        cmd = self.build_ffmpeg_command()
+        cmd_str = " ".join(f'"{arg}"' if " " in arg else arg for arg in cmd)
+        
+        if use_terminal:
+            terminal_info = self.detect_terminal_emulator()
+            if terminal_info:
+                terminal_cmd, exec_flag, title_flag = terminal_info
+                
+                # Build terminal command based on terminal type
+                if terminal_cmd[0] == "gnome-terminal":
+                    # Try modern gnome-terminal syntax first
+                    full_cmd = [
+                        "gnome-terminal",
+                        "--title=Screen Manager - FFmpeg Stream",
+                        "--",
+                    ] + cmd
+                    
+                    # For debugging, also try the simpler approach
+                    alternative_cmd = [
+                        "gnome-terminal",
+                        "--",
+                    ] + cmd
+                    
+                elif terminal_cmd[0] == "x-terminal-emulator":
+                    # Simple execution without title
+                    full_cmd = ["x-terminal-emulator", "-e"] + cmd
+                    alternative_cmd = None
+                else:
+                    # Standard terminal command construction
+                    full_cmd = terminal_cmd.copy()
+                    
+                    # Add title if supported
+                    if title_flag:
+                        full_cmd.extend([title_flag, "Screen Manager - FFmpeg Stream"])
+                    
+                    # Add execute flag and command
+                    full_cmd.extend([exec_flag] + cmd)
+                    alternative_cmd = None
+                
+                logger.info(f"Launching FFmpeg in terminal: {' '.join(full_cmd)}")
+                
+                try:
+                    self.terminal_process = subprocess.Popen(
+                        full_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        preexec_fn=os.setsid  # Create new process group
+                    )
+                    
+                    # Give it time to start
+                    time.sleep(1)
+                    
+                    # For gnome-terminal and similar, the parent process may exit immediately
+                    # but spawn a child process. We need to check for FFmpeg instead.
+                    logger.info("Terminal command launched, waiting for FFmpeg to start...")
+                    
+                    # Wait for FFmpeg process to appear
+                    max_wait = 10  # seconds
+                    waited = 0
+                    ffmpeg_found = False
+                    
+                    while waited < max_wait:
+                        time.sleep(1)
+                        waited += 1
+                        
+                        # Look for FFmpeg process
+                        try:
+                            result = subprocess.run(
+                                ["pgrep", "-f", "ffmpeg.*x11grab"], 
+                                capture_output=True, 
+                                text=True
+                            )
+                            if result.returncode == 0 and result.stdout.strip():
+                                pids = result.stdout.strip().split('\n')
+                                if pids:
+                                    self.ffmpeg_pid = int(pids[0])
+                                    logger.info(f"FFmpeg process found with PID: {self.ffmpeg_pid}")
+                                    ffmpeg_found = True
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Error checking for FFmpeg: {e}")
+                    
+                    if ffmpeg_found:
+                        logger.info("FFmpeg launched successfully in terminal")
+                        return True
+                    else:
+                        logger.warning("FFmpeg process not found, trying alternative command...")
+                        # Try alternative command for gnome-terminal
+                        if alternative_cmd and terminal_cmd[0] == "gnome-terminal":
+                            logger.info(f"Trying alternative command: {' '.join(alternative_cmd)}")
+                            try:
+                                subprocess.Popen(
+                                    alternative_cmd,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    preexec_fn=os.setsid
+                                )
+                                
+                                # Wait again for FFmpeg
+                                time.sleep(3)
+                                waited = 0
+                                while waited < 5:
+                                    time.sleep(1)
+                                    waited += 1
+                                    
+                                    try:
+                                        result = subprocess.run(
+                                            ["pgrep", "-f", "ffmpeg.*x11grab"], 
+                                            capture_output=True, 
+                                            text=True
+                                        )
+                                        if result.returncode == 0 and result.stdout.strip():
+                                            pids = result.stdout.strip().split('\n')
+                                            if pids:
+                                                self.ffmpeg_pid = int(pids[0])
+                                                logger.info(f"FFmpeg process found with alternative command: {self.ffmpeg_pid}")
+                                                return True
+                                    except Exception:
+                                        continue
+                            except Exception as e:
+                                logger.error(f"Alternative command also failed: {e}")
+                        
+                        logger.error("Failed to start FFmpeg in terminal")
+                        return False
+                        
+                except Exception as e:
+                    logger.error(f"Failed to launch terminal: {e}")
+                    return False
+            else:
+                logger.warning("No terminal found, falling back to detached process")
+                use_terminal = False
+        
+        if not use_terminal:
+            # Launch as detached background process
+            return self.launch_detached(cmd, cmd_str)
+    
+    def find_ffmpeg_pid(self) -> None:
+        """Try to find the FFmpeg process PID."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "ffmpeg.*x11grab"], 
+                capture_output=True, 
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                if pids:
+                    self.ffmpeg_pid = int(pids[0])  # Take the first PID
+                    logger.debug(f"Found FFmpeg PID: {self.ffmpeg_pid}")
+        except Exception as e:
+            logger.debug(f"Could not find FFmpeg PID: {e}")
+    
+    def launch_detached(self, cmd: List[str], cmd_str: str) -> bool:
+        """
+        Launch FFmpeg as a detached background process.
+        
+        Args:
+            cmd: Command list to execute
+            cmd_str: Command string for logging
+            
+        Returns:
+            True if successful
+        """
+        try:
+            logger.info(f"Launching FFmpeg as detached process:\n{cmd_str}")
+            
+            # Launch with nohup-like behavior
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=os.setsid,  # Create new process group
+                start_new_session=True  # Start new session (Python 3.2+)
+            )
+            
+            # Give it time to start
+            time.sleep(2)
+            
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read() if self.process.stderr else "No error output"
+                raise StreamError(f"Failed to start ffmpeg as detached process: {stderr_output}")
+            
+            logger.info("FFmpeg launched successfully as detached process")
+            return True
+            
+        except Exception as e:
+            raise StreamError(f"Error starting detached process: {e}")
+    
     def wait_for_client_dimensions(self) -> Optional[Tuple[int, int, str]]:
         """
         Wait briefly for client dimensions packet and return width, height, and client IP.
@@ -421,12 +668,13 @@ class ScreenStreamer:
         logger.info("Using default dimensions and target")
         return None
 
-    def start(self, skip_dimension_check=False) -> bool:
+    def start(self, skip_dimension_check=False, use_terminal=True) -> bool:
         """
         Start the streaming process.
         
         Args:
             skip_dimension_check: Whether to skip waiting for client dimensions
+            use_terminal: Whether to launch in a new terminal window
             
         Returns:
             True if successful
@@ -450,39 +698,145 @@ class ScreenStreamer:
                     logger.info(f"Updated stream dimensions to client size: {width}x{height}")
                     logger.info(f"Updated UDP target to: {self.config.udp_target}")
             
-            cmd = self.build_ffmpeg_command()
-            cmd_str = " ".join(cmd)
-            logger.info(f"Starting stream with command:\n{cmd_str}")
-            
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            time.sleep(1)
-            if self.process.poll() is not None:
-                stderr_output = self.process.stderr.read()
-                raise StreamError(f"Failed to start ffmpeg: {stderr_output}")
-                
-            return True
+            return self.launch_in_terminal(use_terminal)
             
         except Exception as e:
             raise StreamError(f"Error starting stream: {e}")
     
     def stop(self) -> None:
         """Stop the streaming process."""
+        # Stop terminal process if it exists
+        if self.terminal_process and self.terminal_process.poll() is None:
+            try:
+                # Send SIGTERM to the entire process group
+                os.killpg(os.getpgid(self.terminal_process.pid), signal.SIGTERM)
+                try:
+                    self.terminal_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if it doesn't respond
+                    os.killpg(os.getpgid(self.terminal_process.pid), signal.SIGKILL)
+                logger.info("Terminal streaming process stopped")
+            except Exception as e:
+                logger.error(f"Error stopping terminal process: {e}")
+        
+        # Stop regular process if it exists
         if self.process and self.process.poll() is None:
             try:
-                self.process.terminate()
+                # Send SIGTERM to the entire process group
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
                 try:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
-                logger.info("Streaming stopped")
+                    # Force kill if it doesn't respond
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                logger.info("Detached streaming process stopped")
             except Exception as e:
-                logger.error(f"Error stopping stream: {e}")
+                logger.error(f"Error stopping detached process: {e}")
+
+    def is_running(self) -> bool:
+        """
+        Check if the streaming process is still running.
+        
+        Returns:
+            True if running, False otherwise
+        """
+        # If we have a specific FFmpeg PID, check that first
+        if self.ffmpeg_pid:
+            try:
+                # Check if the specific FFmpeg process is still running
+                os.kill(self.ffmpeg_pid, 0)  # Signal 0 just checks if process exists
+                return True
+            except (OSError, ProcessLookupError):
+                # Process doesn't exist anymore
+                logger.debug(f"FFmpeg process {self.ffmpeg_pid} no longer exists")
+                self.ffmpeg_pid = None  # Clear the dead PID
+                return False
+        
+        # Fallback: check if any ffmpeg x11grab process exists
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "ffmpeg.*x11grab"], 
+                capture_output=True, 
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Found an FFmpeg process, update our PID
+                pids = result.stdout.strip().split('\n')
+                if pids:
+                    self.ffmpeg_pid = int(pids[0])
+                    logger.debug(f"Found FFmpeg process with PID: {self.ffmpeg_pid}")
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking for FFmpeg process: {e}")
+        
+        # Check terminal process as last resort
+        if self.terminal_process:
+            return self.terminal_process.poll() is None
+        elif self.process:
+            return self.process.poll() is None
+            
+        return False
+
+    def get_terminal_pid(self) -> Optional[int]:
+        """
+        Get the PID of the terminal process.
+        
+        Returns:
+            Terminal PID if available, None otherwise
+        """
+        if self.terminal_process:
+            return self.terminal_process.pid
+        return None
+
+    def wait_for_terminal_exit(self) -> None:
+        """
+        Wait for the terminal process to exit.
+        This is a blocking call that will wait until the user closes the terminal.
+        """
+        if self.terminal_process:
+            try:
+                logger.info("Waiting for terminal to close... (Close the FFmpeg terminal window to stop)")
+                self.terminal_process.wait()
+                logger.info("Terminal process has ended")
+            except Exception as e:
+                logger.error(f"Error waiting for terminal: {e}")
+        elif self.process:
+            try:
+                logger.info("Waiting for FFmpeg process to end...")
+                self.process.wait()
+                logger.info("FFmpeg process has ended")
+            except Exception as e:
+                logger.error(f"Error waiting for process: {e}")
+
+    def monitor_process(self) -> bool:
+        """
+        Monitor the streaming process and return when it ends.
+        
+        Returns:
+            True if process ended normally, False if there was an error
+        """
+        if not self.is_running():
+            logger.error("No streaming process is running")
+            return False
+        
+        try:
+            check_interval = 2  # Check every 2 seconds
+            logger.info("Monitoring streaming process...")
+            logger.info("*** Close the FFmpeg terminal window to stop streaming and cleanup ***")
+            
+            while True:
+                if not self.is_running():
+                    logger.info("Streaming process has ended")
+                    return True
+                
+                time.sleep(check_interval)
+                
+        except KeyboardInterrupt:
+            logger.info("Monitoring interrupted by user")
+            return True
+        except Exception as e:
+            logger.error(f"Error monitoring process: {e}")
+            return False
 
 
 class ScreenManager:
@@ -496,6 +850,8 @@ class ScreenManager:
         self.cleanup_needed = False
         self.fallback_width = 1920
         self.fallback_height = 1200
+        self.actual_width = None
+        self.actual_height = None
     
     def is_crtc_error(self, error_output: str) -> bool:
         """
@@ -564,6 +920,8 @@ class ScreenManager:
                 DisplayManager.setup_display(display_config, mode_name)
                 
                 self.mode_name = mode_name
+                self.actual_width = width
+                self.actual_height = height
                 self.cleanup_needed = True
                 logger.info(f"Successfully set up display with resolution {width}x{height}")
                 return True, ""
@@ -592,12 +950,13 @@ class ScreenManager:
         
         return False
     
-    def start_streaming(self, config: Union[StreamConfig, Dict]) -> bool:
+    def start_streaming(self, config: Union[StreamConfig, Dict], use_terminal: bool = True) -> bool:
         """
         Start streaming with the given configuration.
         
         Args:
             config: Streaming configuration
+            use_terminal: Whether to launch in terminal
             
         Returns:
             True if successful
@@ -625,14 +984,15 @@ class ScreenManager:
             stream_config = config
         
         self.streamer = ScreenStreamer(stream_config)
-        return self.streamer.start()
+        return self.streamer.start(use_terminal=use_terminal)
     
-    def setup_and_stream(self, config: Dict) -> bool:
+    def setup_and_stream(self, config: Dict, use_terminal: bool = True) -> bool:
         """
         Set up display and start streaming.
         
         Args:
             config: Combined configuration
+            use_terminal: Whether to launch FFmpeg in terminal
             
         Returns:
             True if successful
@@ -685,11 +1045,12 @@ class ScreenManager:
             time.sleep(2)
             
             # IMPORTANT: Update config with the actual dimensions after setup
-            # This ensures we're using the fallback resolution if it was applied
-            if self.fallback_width != config['width'] or self.fallback_height != config['height']:
-                logger.info(f"Updating stream dimensions to match fallback resolution: {self.fallback_width}x{self.fallback_height}")
-                config['width'] = self.fallback_width
-                config['height'] = self.fallback_height
+            # This ensures we're using the actual resolution that was set up
+            if self.actual_width and self.actual_height:
+                if self.actual_width != config['width'] or self.actual_height != config['height']:
+                    logger.info(f"Updating stream dimensions to match actual display resolution: {self.actual_width}x{self.actual_height}")
+                    config['width'] = self.actual_width
+                    config['height'] = self.actual_height
             
             # Create a new streamer with the updated config
             stream_config = StreamConfig(
@@ -709,20 +1070,28 @@ class ScreenManager:
             
             self.streamer = ScreenStreamer(stream_config)
             # Skip dimension check since we already did it
-            return self.streamer.start(skip_dimension_check=True)
+            return self.streamer.start(skip_dimension_check=True, use_terminal=use_terminal)
             
         except Exception as e:
             logger.error(f"Error in setup and stream: {e}")
             return False
     
-    def cleanup(self) -> None:
-        """Clean up resources."""
+    def cleanup(self, keep_display: bool = False) -> None:
+        """
+        Clean up resources.
+        
+        Args:
+            keep_display: If True, don't remove the virtual display
+        """
         if self.streamer:
             self.streamer.stop()
         
-        if self.cleanup_needed and self.output_name and self.mode_name:
+        if not keep_display and self.cleanup_needed and self.output_name and self.mode_name:
             DisplayManager.cleanup_display(self.output_name, self.mode_name)
             self.cleanup_needed = False
+        elif keep_display and self.cleanup_needed:
+            logger.info(f"Keeping virtual display {self.output_name} active (mode: {self.mode_name})")
+            logger.info(f"To manually remove later, run: xrandr --output {self.output_name} --off")
 
 
 def parse_arguments():
@@ -769,6 +1138,11 @@ def parse_arguments():
     stream_group.add_argument("--dimension-wait-time", type=float, default=5.0,
                              help="Time to wait for client dimensions in seconds")
     
+    # Process launching options
+    launch_group = parser.add_argument_group('Launch Options')
+    launch_group.add_argument("--no-terminal", action="store_true",
+                             help="Launch FFmpeg as detached background process instead of terminal")
+    
     # Operation modes
     mode_group = parser.add_argument_group('Mode Options')
     mode_group.add_argument("--setup-only", action="store_true",
@@ -777,6 +1151,8 @@ def parse_arguments():
                            help="Only stream without setting up a new display mode")
     mode_group.add_argument("--no-cleanup", action="store_true",
                            help="Don't automatically clean up after setup")
+    mode_group.add_argument("--keep-display", action="store_true",
+                           help="Keep the virtual display active even after streaming ends")
     mode_group.add_argument("--debug", action="store_true",
                            help="Show additional debug information")
     
@@ -788,21 +1164,37 @@ def main():
     args = parse_arguments()
     config = vars(args)
     
+    # Terminal mode is now the default (use terminal unless --no-terminal is specified)
+    use_terminal = not args.no_terminal
+    
     # Configure logging based on debug flag
     if args.debug:
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
     
+    logger.info(f"Launch mode: {'Terminal' if use_terminal else 'Detached process'}")
+    
     manager = ScreenManager()
+    
+    # Global flag to prevent multiple cleanup calls
+    cleanup_done = False
     
     # Handle Ctrl-C gracefully
     def signal_handler(sig, frame):
+        nonlocal cleanup_done
+        if cleanup_done:
+            logger.info("Already cleaning up, forcing exit...")
+            sys.exit(1)
+            
+        cleanup_done = True
         logger.info("Stopping and cleaning up...")
         if not args.no_cleanup:
-            manager.cleanup()
+            manager.cleanup(keep_display=args.keep_display)
+        logger.info("Cleanup complete, exiting...")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         if args.setup_only:
@@ -811,25 +1203,60 @@ def main():
                 sys.exit(1)
             logger.info("Display setup complete. Press Ctrl+C to clean up...")
             
+            # Wait indefinitely for Ctrl+C
+            while True:
+                time.sleep(1)
+            
         elif args.stream_only:
-            if not manager.start_streaming(config):
+            if not manager.start_streaming(config, use_terminal):
                 logger.error("Stream start failed")
                 sys.exit(1)
-            logger.info("Streaming started. Press Ctrl+C to stop...")
+            
+            if use_terminal:
+                logger.info("Streaming started in terminal. Close the terminal window or press Ctrl+C to stop...")
+                # Monitor the terminal process
+                manager.streamer.monitor_process()
+            else:
+                logger.info("Streaming started as background process. Press Ctrl+C to stop...")
+                # Monitor the background process
+                while manager.streamer.is_running():
+                    time.sleep(1)
             
         else:
-            if not manager.setup_and_stream(config):
+            # Combined setup and stream
+            if not manager.setup_and_stream(config, use_terminal):
                 logger.error("Display setup and/or streaming failed")
                 sys.exit(1)
-            logger.info("Display setup and streaming started. Press Ctrl+C to stop...")
-        
-        # Main loop
-        while True:
-            time.sleep(1)
-            if (manager.streamer and manager.streamer.process and 
-                manager.streamer.process.poll() is not None):
-                logger.error("Streaming process ended unexpectedly")
-                break
+            
+            # Give a moment for everything to stabilize
+            time.sleep(2)
+            
+            # Verify streaming is actually running before continuing
+            if not manager.streamer or not manager.streamer.is_running():
+                logger.error("Streaming failed to start properly")
+                sys.exit(1)
+            
+            if use_terminal:
+                logger.info("Display setup and streaming started successfully!")
+                logger.info(f"Virtual display created at resolution: {manager.actual_width or config.get('width', 'unknown')}x{manager.actual_height or config.get('height', 'unknown')}")
+                logger.info("=" * 60)
+                logger.info("IMPORTANT: To stop streaming and cleanup:")
+                logger.info("  1. Close the FFmpeg terminal window, OR")
+                logger.info("  2. Press Ctrl+C in this window")
+                logger.info("=" * 60)
+                
+                # Monitor the terminal process - this will block until terminal closes
+                manager.streamer.monitor_process()
+                logger.info("Streaming ended, performing cleanup...")
+            else:
+                logger.info("Display setup and streaming started as background process. Press Ctrl+C to stop...")
+                
+                # Monitor the background process
+                while True:
+                    if not manager.streamer.is_running():
+                        logger.error("Streaming process ended unexpectedly")
+                        break
+                    time.sleep(1)
                 
     except KeyboardInterrupt:
         logger.info("Operation interrupted by user")
@@ -837,8 +1264,14 @@ def main():
         logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        if not args.no_cleanup:
-            manager.cleanup()
+        if not cleanup_done and not args.no_cleanup:
+            logger.info("Performing final cleanup...")
+            manager.cleanup(keep_display=args.keep_display)
+            cleanup_done = True
+        elif args.no_cleanup:
+            logger.info("Cleanup skipped (--no-cleanup specified)")
+            if args.keep_display:
+                logger.info("Virtual display will remain active")
 
 
 if __name__ == "__main__":
