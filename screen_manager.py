@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Screen Manager - A tool for creating and streaming virtual displays.
+Screen Manager - A tool for creating and streaming virtual displays with Network Service Discovery.
 
 This program sets up custom display resolutions and can stream display content
-over UDP with low latency using FFmpeg.
+over UDP with low latency using FFmpeg. Now includes mDNS service discovery
+for automatic client connection.
 """
 
 import argparse
@@ -16,8 +17,18 @@ import socket
 import subprocess
 import sys
 import time
+import threading
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
+
+# Service Discovery imports
+try:
+    from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceListener
+    ZEROCONF_AVAILABLE = True
+except ImportError:
+    ZEROCONF_AVAILABLE = False
+    print("Warning: zeroconf not available. Install with: pip install zeroconf")
 
 
 # Configure logging
@@ -45,6 +56,11 @@ class StreamError(ScreenManagerError):
 
 class CommandError(ScreenManagerError):
     """Exception for command execution errors."""
+    pass
+
+
+class ServiceDiscoveryError(ScreenManagerError):
+    """Exception for service discovery errors."""
     pass
 
 
@@ -82,6 +98,10 @@ class StreamConfig:
     offset_x: Optional[int] = None
     offset_y: Optional[int] = None
     dimension_wait_time: float = 5.0
+    low_latency: bool = False
+    buffer_size: str = "auto"
+    keyframe_interval: Optional[int] = None
+    packet_size: int = 1316
 
 
 @dataclass
@@ -94,6 +114,205 @@ class ScreenInfo:
     position: Optional[Position] = None
     primary: bool = False
     geometry: Optional[Tuple[int, int, int, int]] = None  # width, height, x, y
+
+
+@dataclass
+class ClientInfo:
+    """Information about a discovered client."""
+    name: str
+    address: str
+    port: int
+    width: int
+    height: int
+    service_type: str
+    discovered_at: float
+
+
+class ServiceDiscoveryManager:
+    """Manages mDNS service discovery for screen streaming."""
+    
+    SERVICE_TYPE = "_screenstream._udp.local."
+    
+    def __init__(self, service_name: str = None):
+        """
+        Initialize service discovery manager.
+        
+        Args:
+            service_name: Name for this service (defaults to hostname)
+        """
+        if not ZEROCONF_AVAILABLE:
+            raise ServiceDiscoveryError("zeroconf library not available")
+        
+        self.zeroconf = Zeroconf()
+        self.service_name = service_name or socket.gethostname()
+        self.service_info = None
+        self.clients = {}
+        self.client_callbacks = []
+        self.browser = None
+        self._lock = threading.Lock()
+        
+    def register_service(self, port: int, width: int = 1920, height: int = 1080, 
+                        framerate: int = 30, **kwargs) -> None:
+        """
+        Register this service for discovery.
+        
+        Args:
+            port: UDP port for streaming
+            width: Default screen width
+            height: Default screen height
+            framerate: Default framerate
+            **kwargs: Additional service properties
+        """
+        properties = {
+            'width': str(width),
+            'height': str(height),
+            'framerate': str(framerate),
+            'version': '1.0',
+            'type': 'linux_server',
+            **{k: str(v) for k, v in kwargs.items()}
+        }
+        
+        # Encode properties for zeroconf
+        encoded_props = {k.encode('utf-8'): v.encode('utf-8') for k, v in properties.items()}
+        
+        self.service_info = ServiceInfo(
+            self.SERVICE_TYPE,
+            f"{self.service_name}.{self.SERVICE_TYPE}",
+            addresses=[socket.inet_aton(self._get_local_ip())],
+            port=port,
+            properties=encoded_props,
+            server=f"{self.service_name}.local."
+        )
+        
+        try:
+            self.zeroconf.register_service(self.service_info)
+            logger.info(f"Registered service: {self.service_name} on port {port}")
+            logger.info(f"Service properties: {properties}")
+        except Exception as e:
+            raise ServiceDiscoveryError(f"Failed to register service: {e}")
+    
+    def _get_local_ip(self) -> str:
+        """Get the local IP address."""
+        try:
+            # Create a socket to determine the local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+    
+    def add_client_callback(self, callback):
+        """Add a callback to be called when clients are discovered."""
+        self.client_callbacks.append(callback)
+    
+    def start_discovery(self) -> None:
+        """Start discovering clients."""
+        if self.browser:
+            return
+        
+        listener = ClientListener(self)
+        self.browser = ServiceBrowser(self.zeroconf, self.SERVICE_TYPE, listener)
+        logger.info("Started client discovery")
+    
+    def stop_discovery(self) -> None:
+        """Stop discovering clients."""
+        if self.browser:
+            self.browser.cancel()
+            self.browser = None
+        logger.info("Stopped client discovery")
+    
+    def get_clients(self) -> Dict[str, ClientInfo]:
+        """Get discovered clients."""
+        with self._lock:
+            return self.clients.copy()
+    
+    def _add_client(self, name: str, client_info: ClientInfo) -> None:
+        """Add a discovered client."""
+        with self._lock:
+            self.clients[name] = client_info
+            logger.info(f"Discovered client: {name} at {client_info.address}:{client_info.port} "
+                       f"({client_info.width}x{client_info.height})")
+        
+        # Notify callbacks
+        for callback in self.client_callbacks:
+            try:
+                callback(name, client_info)
+            except Exception as e:
+                logger.error(f"Error in client callback: {e}")
+    
+    def _remove_client(self, name: str) -> None:
+        """Remove a client."""
+        with self._lock:
+            if name in self.clients:
+                del self.clients[name]
+                logger.info(f"Client disconnected: {name}")
+    
+    def unregister_service(self) -> None:
+        """Unregister this service."""
+        if self.service_info:
+            try:
+                self.zeroconf.unregister_service(self.service_info)
+                logger.info("Unregistered service")
+            except Exception as e:
+                logger.error(f"Error unregistering service: {e}")
+    
+    def close(self) -> None:
+        """Close the service discovery manager."""
+        self.stop_discovery()
+        self.unregister_service()
+        self.zeroconf.close()
+
+
+class ClientListener(ServiceListener):
+    """Listener for client service discovery."""
+    
+    def __init__(self, manager: ServiceDiscoveryManager):
+        self.manager = manager
+    
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when a service is discovered."""
+        info = zc.get_service_info(type_, name)
+        if info:
+            try:
+                # Decode service properties
+                props = {}
+                if info.properties:
+                    for key, value in info.properties.items():
+                        props[key.decode('utf-8')] = value.decode('utf-8')
+                
+                # Extract client information
+                address = socket.inet_ntoa(info.addresses[0]) if info.addresses else "unknown"
+                width = int(props.get('width', 1920))
+                height = int(props.get('height', 1080))
+                service_type = props.get('type', 'unknown')
+                
+                client_info = ClientInfo(
+                    name=name,
+                    address=address,
+                    port=info.port,
+                    width=width,
+                    height=height,
+                    service_type=service_type,
+                    discovered_at=time.time()
+                )
+                
+                # Only add Android clients (ignore our own service)
+                if service_type.lower() in ['android_client', 'android', 'client']:
+                    self.manager._add_client(name, client_info)
+                
+            except Exception as e:
+                logger.error(f"Error processing discovered service {name}: {e}")
+    
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when a service is removed."""
+        self.manager._remove_client(name)
+    
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        """Called when a service is updated."""
+        # Re-add the service to update information
+        self.add_service(zc, type_, name)
 
 
 class CommandRunner:
@@ -353,17 +572,46 @@ class ScreenStreamer:
         else:
             offset_x, offset_y = self.get_display_position()
         
-        # Calculate buffer size (should be at least equal to bitrate, often 2x)
+        # Calculate buffer size for latency optimization
         bitrate_value = float(self.config.bitrate[:-1])
         bitrate_unit = self.config.bitrate[-1]
-        bufsize_value = max(bitrate_value * 2, bitrate_value)  # At least 2x bitrate
-        bufsize = f"{int(bufsize_value)}{bitrate_unit}"
         
-        return [
+        if self.config.buffer_size == "auto":
+            if self.config.low_latency:
+                bufsize_multiplier = 0.25  # Very small buffer for ultra-low latency
+            else:
+                bufsize_multiplier = 0.5   # Moderate buffer
+        else:
+            bufsize_multiplier = float(self.config.buffer_size)
+        
+        bufsize_value = bitrate_value * bufsize_multiplier
+        bufsize = f"{max(int(bufsize_value), 32)}{bitrate_unit}"  # Minimum 32k buffer
+        
+        # Determine keyframe interval
+        keyframe_interval = self.config.keyframe_interval or self.config.framerate
+        if self.config.low_latency:
+            keyframe_interval = min(keyframe_interval, 15)  # More frequent keyframes for low latency
+        
+        cmd = [
             "ffmpeg",
             "-f", "x11grab",
             "-video_size", f"{self.config.width}x{self.config.height}",
             "-framerate", str(self.config.framerate),
+        ]
+        
+        # Add low-latency input options
+        if self.config.low_latency:
+            cmd.extend([
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-fflags", "+nobuffer",
+            ])
+        else:
+            cmd.extend([
+                "-probesize", "1000000",  # 1MB probe size
+            ])
+        
+        cmd.extend([
             "-i", f":0.0+{offset_x},{offset_y}",
             "-c:v", "libx264",
             "-preset", self.config.preset,
@@ -372,12 +620,44 @@ class ScreenStreamer:
             "-b:v", self.config.bitrate,
             "-maxrate", self.config.bitrate,
             "-bufsize", bufsize,
-            "-g", str(self.config.framerate),
+            "-g", str(keyframe_interval),
+        ])
+        
+        # Add low-latency encoding options
+        if self.config.low_latency:
+            cmd.extend([
+                "-bf", "0",           # No B-frames
+                "-refs", "1",         # Single reference frame
+                "-rc-lookahead", "0", # No lookahead
+                "-slices", "1",       # Single slice
+                "-intra-refresh", "1", # Intra refresh
+            ])
+        
+        cmd.extend([
             "-profile:v", "baseline",
             "-pix_fmt", "yuv420p",
+            "-flags", "+global_header",
+            "-avoid_negative_ts", "make_zero",
+        ])
+        
+        # Add output fflags for low latency
+        if self.config.low_latency:
+            cmd.extend(["-fflags", "+nobuffer+flush_packets"])
+        
+        cmd.extend([
             "-f", "mpegts",
-            self.config.udp_target
-        ]
+        ])
+        
+        # Add UDP options for lower latency
+        if "?" in self.config.udp_target:
+            cmd.append(self.config.udp_target)
+        else:
+            if self.config.low_latency:
+                cmd.append(f"{self.config.udp_target}?pkt_size={self.config.packet_size}&buffer_size=0&flush_packets=1")
+            else:
+                cmd.append(f"{self.config.udp_target}?pkt_size={self.config.packet_size}")
+        
+        return cmd
     
     def detect_terminal_emulator(self) -> Optional[Tuple[List[str], str, Optional[str]]]:
         """
@@ -619,55 +899,6 @@ class ScreenStreamer:
         except Exception as e:
             raise StreamError(f"Error starting detached process: {e}")
     
-    def wait_for_client_dimensions(self) -> Optional[Tuple[int, int, str]]:
-        """
-        Wait briefly for client dimensions packet and return width, height, and client IP.
-        
-        Returns:
-            Tuple of (width, height, client_ip) if received, None otherwise
-        """
-        try:
-            # Extract port from UDP target
-            target_parts = self.config.udp_target.split(':')
-            if len(target_parts) >= 3:
-                port = int(target_parts[2])
-                
-                # Create a socket to listen for dimensions
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind(('0.0.0.0', port))
-                sock.settimeout(self.config.dimension_wait_time)
-                
-                logger.info(f"Waiting for client dimensions on port {port} for {self.config.dimension_wait_time} seconds...")
-                data, addr = sock.recvfrom(1024)
-                message = data.decode('utf-8')
-                
-                # Check if this is a dimensions packet
-                if message.startswith("DIMS:"):
-                    parts = message.split(':')
-                    client_ip = addr[0]  # Default to source IP of the packet
-                    
-                    if len(parts) >= 3:
-                        width = int(parts[1])
-                        height = int(parts[2])
-                        
-                        # If client included its IP, use that instead
-                        if len(parts) >= 4 and parts[3]:
-                            client_ip = parts[3]
-                        
-                        logger.info(f"Received client dimensions: {width}x{height} from {client_ip}")
-                        sock.close()
-                        return width, height, client_ip
-                
-                sock.close()
-                
-        except socket.timeout:
-            logger.info("No client dimensions received within timeout period")
-        except Exception as e:
-            logger.error(f"Error receiving dimensions: {e}")
-        
-        logger.info("Using default dimensions and target")
-        return None
-
     def start(self, skip_dimension_check=False, use_terminal=True) -> bool:
         """
         Start the streaming process.
@@ -683,21 +914,6 @@ class ScreenStreamer:
             StreamError: If streaming fails to start
         """
         try:
-            # Listen for client dimensions first if not skipping dimension check
-            if not skip_dimension_check:
-                client_info = self.wait_for_client_dimensions()
-                if client_info:
-                    width, height, client_ip = client_info
-                    self.config.width = width
-                    self.config.height = height
-                    
-                    # Update UDP target to use client's IP while keeping port
-                    udp_parts = self.config.udp_target.split(':')
-                    port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
-                    self.config.udp_target = f"udp://{client_ip}:{port}"
-                    logger.info(f"Updated stream dimensions to client size: {width}x{height}")
-                    logger.info(f"Updated UDP target to: {self.config.udp_target}")
-            
             return self.launch_in_terminal(use_terminal)
             
         except Exception as e:
@@ -777,37 +993,6 @@ class ScreenStreamer:
             
         return False
 
-    def get_terminal_pid(self) -> Optional[int]:
-        """
-        Get the PID of the terminal process.
-        
-        Returns:
-            Terminal PID if available, None otherwise
-        """
-        if self.terminal_process:
-            return self.terminal_process.pid
-        return None
-
-    def wait_for_terminal_exit(self) -> None:
-        """
-        Wait for the terminal process to exit.
-        This is a blocking call that will wait until the user closes the terminal.
-        """
-        if self.terminal_process:
-            try:
-                logger.info("Waiting for terminal to close... (Close the FFmpeg terminal window to stop)")
-                self.terminal_process.wait()
-                logger.info("Terminal process has ended")
-            except Exception as e:
-                logger.error(f"Error waiting for terminal: {e}")
-        elif self.process:
-            try:
-                logger.info("Waiting for FFmpeg process to end...")
-                self.process.wait()
-                logger.info("FFmpeg process has ended")
-            except Exception as e:
-                logger.error(f"Error waiting for process: {e}")
-
     def monitor_process(self) -> bool:
         """
         Monitor the streaming process and return when it ends.
@@ -840,10 +1025,16 @@ class ScreenStreamer:
 
 
 class ScreenManager:
-    """Main class that manages both display setup and streaming."""
+    """Main class that manages both display setup and streaming with service discovery."""
     
-    def __init__(self):
-        """Initialize the screen manager."""
+    def __init__(self, service_name: str = None, enable_discovery: bool = True):
+        """
+        Initialize the screen manager.
+        
+        Args:
+            service_name: Name for service discovery (defaults to hostname)
+            enable_discovery: Whether to enable service discovery
+        """
         self.streamer = None
         self.output_name = None
         self.mode_name = None
@@ -852,6 +1043,113 @@ class ScreenManager:
         self.fallback_height = 1200
         self.actual_width = None
         self.actual_height = None
+        self.selected_client = None
+        
+        # Service discovery
+        self.enable_discovery = enable_discovery and ZEROCONF_AVAILABLE
+        self.discovery_manager = None
+        
+        if self.enable_discovery:
+            try:
+                self.discovery_manager = ServiceDiscoveryManager(service_name)
+                self.discovery_manager.add_client_callback(self._on_client_discovered)
+            except ServiceDiscoveryError as e:
+                logger.warning(f"Service discovery disabled: {e}")
+                self.enable_discovery = False
+    
+    def _on_client_discovered(self, name: str, client_info: ClientInfo) -> None:
+        """Callback for when a client is discovered."""
+        logger.info(f"New client available: {name} ({client_info.width}x{client_info.height})")
+    
+    def start_service_discovery(self, port: int = 5001, **kwargs) -> None:
+        """
+        Start service discovery.
+        
+        Args:
+            port: Port to advertise
+            **kwargs: Additional service properties
+        """
+        if not self.enable_discovery:
+            logger.warning("Service discovery not available")
+            return
+        
+        try:
+            self.discovery_manager.register_service(port, **kwargs)
+            self.discovery_manager.start_discovery()
+            logger.info("Service discovery started")
+        except Exception as e:
+            logger.error(f"Failed to start service discovery: {e}")
+    
+    def list_clients(self) -> Dict[str, ClientInfo]:
+        """
+        List discovered clients.
+        
+        Returns:
+            Dictionary of client names to ClientInfo objects
+        """
+        if not self.enable_discovery:
+            return {}
+        return self.discovery_manager.get_clients()
+    
+    def select_client(self, client_name: str = None) -> Optional[ClientInfo]:
+        """
+        Select a client for streaming.
+        
+        Args:
+            client_name: Name of client to select (None for auto-select)
+            
+        Returns:
+            Selected ClientInfo or None
+        """
+        clients = self.list_clients()
+        
+        if not clients:
+            logger.warning("No clients discovered")
+            return None
+        
+        if client_name:
+            if client_name in clients:
+                self.selected_client = clients[client_name]
+                logger.info(f"Selected client: {client_name}")
+            else:
+                logger.error(f"Client '{client_name}' not found")
+                return None
+        else:
+            # Auto-select the most recent client
+            newest_client = max(clients.values(), key=lambda c: c.discovered_at)
+            self.selected_client = newest_client
+            logger.info(f"Auto-selected newest client: {newest_client.name}")
+        
+        return self.selected_client
+    
+    def wait_for_client(self, timeout: float = 30.0) -> Optional[ClientInfo]:
+        """
+        Wait for a client to be discovered.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            First discovered client or None if timeout
+        """
+        if not self.enable_discovery:
+            logger.warning("Service discovery not available")
+            return None
+        
+        logger.info(f"Waiting for client discovery (timeout: {timeout}s)...")
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            clients = self.list_clients()
+            if clients:
+                client = list(clients.values())[0]
+                self.selected_client = client
+                logger.info(f"Client discovered: {client.name}")
+                return client
+            time.sleep(1)
+        
+        logger.warning("No clients discovered within timeout")
+        return None
     
     def is_crtc_error(self, error_output: str) -> bool:
         """
@@ -978,7 +1276,11 @@ class ScreenManager:
                 qp=config['qp'],
                 offset_x=config.get('offset_x'),
                 offset_y=config.get('offset_y'),
-                dimension_wait_time=config.get('dimension_wait_time', 5.0)
+                dimension_wait_time=config.get('dimension_wait_time', 5.0),
+                low_latency=config.get('low_latency', False),
+                buffer_size=config.get('buffer_size', 'auto'),
+                keyframe_interval=config.get('keyframe_interval'),
+                packet_size=config.get('packet_size', 1316)
             )
         else:
             stream_config = config
@@ -986,47 +1288,50 @@ class ScreenManager:
         self.streamer = ScreenStreamer(stream_config)
         return self.streamer.start(use_terminal=use_terminal)
     
-    def setup_and_stream(self, config: Dict, use_terminal: bool = True) -> bool:
+    def setup_and_stream_with_discovery(self, config: Dict, use_terminal: bool = True, 
+                                       client_name: str = None, wait_timeout: float = 30.0) -> bool:
         """
-        Set up display and start streaming.
+        Set up display and start streaming using service discovery.
         
         Args:
-            config: Combined configuration
+            config: Base configuration
             use_terminal: Whether to launch FFmpeg in terminal
+            client_name: Specific client to select (None for auto-select)
+            wait_timeout: How long to wait for client discovery
             
         Returns:
             True if successful
         """
         try:
-            # Create a temporary streamer to try and get client dimensions
-            stream_config = StreamConfig(
-                width=config['width'],
-                height=config['height'],
-                framerate=config['framerate'],
-                output=config['output'],
-                udp_target=config['udp_target'],
-                bitrate=config['bitrate'],
-                preset=config['preset'],
-                tune=config['tune'],
-                qp=config['qp'],
-                offset_x=config.get('offset_x'),
-                offset_y=config.get('offset_y'),
-                dimension_wait_time=config.get('dimension_wait_time', 5.0)
-            )
+            # Start service discovery if not already started
+            if self.enable_discovery and self.discovery_manager:
+                self.start_service_discovery(
+                    port=config.get('stream_port', 5001),
+                    width=config['width'],
+                    height=config['height'],
+                    framerate=config['framerate']
+                )
             
-            temp_streamer = ScreenStreamer(stream_config)
-            client_info = temp_streamer.wait_for_client_dimensions()
+            # Wait for or select client
+            if client_name:
+                # Wait a bit for discovery, then select specific client
+                time.sleep(2)
+                client = self.select_client(client_name)
+            else:
+                # Wait for any client
+                client = self.wait_for_client(wait_timeout)
             
-            if client_info:
-                width, height, client_ip = client_info
-                config['width'] = width
-                config['height'] = height
-                
-                # Update UDP target to use client's IP while keeping port
-                udp_parts = config['udp_target'].split(':')
-                port = udp_parts[-1] if len(udp_parts) >= 3 else "5001"
-                config['udp_target'] = f"udp://{client_ip}:{port}"
-                logger.info(f"Updated UDP target to: {config['udp_target']}")
+            if not client:
+                logger.error("No client available for streaming")
+                return False
+            
+            # Update config with client information
+            config['width'] = client.width
+            config['height'] = client.height
+            config['udp_target'] = f"udp://{client.address}:{client.port}"
+            
+            logger.info(f"Configured for client: {client.name} at {client.address}:{client.port}")
+            logger.info(f"Stream dimensions: {client.width}x{client.height}")
             
             # Set up display
             display_config = DisplayConfig(
@@ -1044,8 +1349,74 @@ class ScreenManager:
             # Give the display a moment to stabilize
             time.sleep(2)
             
-            # IMPORTANT: Update config with the actual dimensions after setup
-            # This ensures we're using the actual resolution that was set up
+            # Update config with actual dimensions after setup
+            if self.actual_width and self.actual_height:
+                if self.actual_width != config['width'] or self.actual_height != config['height']:
+                    logger.info(f"Updating stream dimensions to match actual display resolution: {self.actual_width}x{self.actual_height}")
+                    config['width'] = self.actual_width
+                    config['height'] = self.actual_height
+            
+            # Create streamer with the updated config
+            stream_config = StreamConfig(
+                width=config['width'],
+                height=config['height'],
+                framerate=config['framerate'],
+                output=config['output'],
+                udp_target=config['udp_target'],
+                bitrate=config['bitrate'],
+                preset=config['preset'],
+                tune=config['tune'],
+                qp=config['qp'],
+                offset_x=config.get('offset_x'),
+                offset_y=config.get('offset_y'),
+                dimension_wait_time=config.get('dimension_wait_time', 5.0),
+                low_latency=config.get('low_latency', False),
+                buffer_size=config.get('buffer_size', 'auto'),
+                keyframe_interval=config.get('keyframe_interval'),
+                packet_size=config.get('packet_size', 1316)
+            )
+            
+            self.streamer = ScreenStreamer(stream_config)
+            return self.streamer.start(skip_dimension_check=True, use_terminal=use_terminal)
+            
+        except Exception as e:
+            logger.error(f"Error in setup and stream with discovery: {e}")
+            return False
+    
+    def setup_and_stream(self, config: Dict, use_terminal: bool = True) -> bool:
+        """
+        Set up display and start streaming (legacy method for backward compatibility).
+        
+        Args:
+            config: Combined configuration
+            use_terminal: Whether to launch FFmpeg in terminal
+            
+        Returns:
+            True if successful
+        """
+        # If service discovery is enabled, use the new method
+        if self.enable_discovery:
+            return self.setup_and_stream_with_discovery(config, use_terminal)
+        
+        # Otherwise, fall back to the original method
+        try:
+            # Set up display
+            display_config = DisplayConfig(
+                width=config['width'],
+                height=config['height'],
+                refresh_rate=config['refresh_rate'],
+                output=config['output'],
+                position=Position(config['position']),
+                relative_to=config['relative_to']
+            )
+            
+            if not self.setup_display(display_config):
+                return False
+            
+            # Give the display a moment to stabilize
+            time.sleep(2)
+            
+            # Update config with the actual dimensions after setup
             if self.actual_width and self.actual_height:
                 if self.actual_width != config['width'] or self.actual_height != config['height']:
                     logger.info(f"Updating stream dimensions to match actual display resolution: {self.actual_width}x{self.actual_height}")
@@ -1065,12 +1436,15 @@ class ScreenManager:
                 qp=config['qp'],
                 offset_x=config.get('offset_x'),
                 offset_y=config.get('offset_y'),
-                dimension_wait_time=config.get('dimension_wait_time', 5.0)
+                dimension_wait_time=config.get('dimension_wait_time', 5.0),
+                low_latency=config.get('low_latency', False),
+                buffer_size=config.get('buffer_size', 'auto'),
+                keyframe_interval=config.get('keyframe_interval'),
+                packet_size=config.get('packet_size', 1316)
             )
             
             self.streamer = ScreenStreamer(stream_config)
-            # Skip dimension check since we already did it
-            return self.streamer.start(skip_dimension_check=True, use_terminal=use_terminal)
+            return self.streamer.start(skip_dimension_check=False, use_terminal=use_terminal)
             
         except Exception as e:
             logger.error(f"Error in setup and stream: {e}")
@@ -1086,6 +1460,9 @@ class ScreenManager:
         if self.streamer:
             self.streamer.stop()
         
+        if self.enable_discovery and self.discovery_manager:
+            self.discovery_manager.close()
+        
         if not keep_display and self.cleanup_needed and self.output_name and self.mode_name:
             DisplayManager.cleanup_display(self.output_name, self.mode_name)
             self.cleanup_needed = False
@@ -1097,16 +1474,16 @@ class ScreenManager:
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Manage custom display resolutions and stream screen content",
+        description="Manage custom display resolutions and stream screen content with service discovery",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     # Display parameters
     display_group = parser.add_argument_group('Display Options')
     display_group.add_argument("--width", type=int, default=1920, 
-                              help="Width of the display in pixels")
+                              help="Width of the display in pixels (overridden by client discovery)")
     display_group.add_argument("--height", type=int, default=1080, 
-                              help="Height of the display in pixels")
+                              help="Height of the display in pixels (overridden by client discovery)")
     display_group.add_argument("--refresh-rate", type=float, default=60.0, 
                               help="Refresh rate in Hz")
     display_group.add_argument("--output", default="HDMI-1",
@@ -1121,8 +1498,10 @@ def parse_arguments():
     stream_group = parser.add_argument_group('Streaming Options')
     stream_group.add_argument("--framerate", type=int, default=30,
                              help="Target framerate for streaming")
-    stream_group.add_argument("--udp-target", default="udp://10.1.10.251:5001",
-                             help="UDP target address")
+    stream_group.add_argument("--udp-target", default="udp://auto:5001",
+                             help="UDP target address (use 'auto' for service discovery)")
+    stream_group.add_argument("--stream-port", type=int, default=5001,
+                             help="Port for streaming service")
     stream_group.add_argument("--bitrate", default="1M",
                              help="Target bitrate (e.g., 1M, 500K)")
     stream_group.add_argument("--preset", default="ultrafast",
@@ -1131,12 +1510,34 @@ def parse_arguments():
     stream_group.add_argument("--tune", default="zerolatency",
                              choices=["zerolatency", "fastdecode"],
                              help="Encoding tuning")
-    stream_group.add_argument("--qp", type=int, default=30,
+    stream_group.add_argument("--qp", type=int, default=23,
                              help="Quantization parameter (0-51, lower is better quality)")
     stream_group.add_argument("--offset-x", type=int, help="Manual X offset for capture")
     stream_group.add_argument("--offset-y", type=int, help="Manual Y offset for capture")
-    stream_group.add_argument("--dimension-wait-time", type=float, default=5.0,
-                             help="Time to wait for client dimensions in seconds")
+    
+    # Low latency options
+    latency_group = parser.add_argument_group('Latency Options')
+    latency_group.add_argument("--low-latency", action="store_true",
+                              help="Enable aggressive low latency settings")
+    latency_group.add_argument("--buffer-size", default="auto",
+                              help="Buffer size multiplier (auto, 0.1, 0.5, 1.0, 2.0)")
+    latency_group.add_argument("--keyframe-interval", type=int, default=None,
+                              help="Keyframe interval (default: framerate)")
+    latency_group.add_argument("--packet-size", type=int, default=1316,
+                              help="UDP packet size for streaming")
+    
+    # Service Discovery options
+    discovery_group = parser.add_argument_group('Service Discovery Options')
+    discovery_group.add_argument("--no-discovery", action="store_true",
+                                help="Disable service discovery (use manual UDP target)")
+    discovery_group.add_argument("--service-name", default=None,
+                                help="Service name for discovery (defaults to hostname)")
+    discovery_group.add_argument("--client-name", default=None,
+                                help="Specific client name to connect to")
+    discovery_group.add_argument("--discovery-timeout", type=float, default=30.0,
+                                help="Timeout for client discovery in seconds")
+    discovery_group.add_argument("--list-clients", action="store_true",
+                                help="List discovered clients and exit")
     
     # Process launching options
     launch_group = parser.add_argument_group('Launch Options')
@@ -1172,9 +1573,17 @@ def main():
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
     
-    logger.info(f"Launch mode: {'Terminal' if use_terminal else 'Detached process'}")
+    # Check if zeroconf is available for service discovery
+    enable_discovery = not args.no_discovery and ZEROCONF_AVAILABLE
+    if args.no_discovery:
+        logger.info("Service discovery disabled by user")
+    elif not ZEROCONF_AVAILABLE:
+        logger.warning("Service discovery unavailable (install zeroconf: pip install zeroconf)")
     
-    manager = ScreenManager()
+    logger.info(f"Launch mode: {'Terminal' if use_terminal else 'Detached process'}")
+    logger.info(f"Service discovery: {'Enabled' if enable_discovery else 'Disabled'}")
+    
+    manager = ScreenManager(service_name=args.service_name, enable_discovery=enable_discovery)
     
     # Global flag to prevent multiple cleanup calls
     cleanup_done = False
@@ -1197,6 +1606,28 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
+        # List clients mode
+        if args.list_clients:
+            if not enable_discovery:
+                logger.error("Service discovery not available for listing clients")
+                sys.exit(1)
+            
+            logger.info("Starting discovery to list clients...")
+            manager.start_service_discovery(port=args.stream_port)
+            
+            # Wait for discovery
+            time.sleep(5)
+            clients = manager.list_clients()
+            
+            if clients:
+                logger.info("Discovered clients:")
+                for name, client in clients.items():
+                    logger.info(f"  {name}: {client.address}:{client.port} ({client.width}x{client.height}) [{client.service_type}]")
+            else:
+                logger.info("No clients discovered")
+            
+            return
+        
         if args.setup_only:
             if not manager.setup_display(config):
                 logger.error("Display setup failed")
@@ -1224,7 +1655,19 @@ def main():
             
         else:
             # Combined setup and stream
-            if not manager.setup_and_stream(config, use_terminal):
+            if enable_discovery and "auto" in args.udp_target:
+                # Use service discovery mode
+                success = manager.setup_and_stream_with_discovery(
+                    config, 
+                    use_terminal, 
+                    args.client_name,
+                    args.discovery_timeout
+                )
+            else:
+                # Use legacy mode without service discovery
+                success = manager.setup_and_stream(config, use_terminal)
+            
+            if not success:
                 logger.error("Display setup and/or streaming failed")
                 sys.exit(1)
             
@@ -1238,6 +1681,8 @@ def main():
             
             if use_terminal:
                 logger.info("Display setup and streaming started successfully!")
+                if manager.selected_client:
+                    logger.info(f"Streaming to client: {manager.selected_client.name} at {manager.selected_client.address}")
                 logger.info(f"Virtual display created at resolution: {manager.actual_width or config.get('width', 'unknown')}x{manager.actual_height or config.get('height', 'unknown')}")
                 logger.info("=" * 60)
                 logger.info("IMPORTANT: To stop streaming and cleanup:")
