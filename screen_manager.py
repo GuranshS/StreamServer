@@ -131,7 +131,8 @@ class ClientInfo:
 class ServiceDiscoveryManager:
     """Manages mDNS service discovery for screen streaming."""
     
-    SERVICE_TYPE = "_screenstream._udp.local."
+    # Match the Android client's service type exactly
+    SERVICE_TYPE = "_screenstream._tcp.local."
     
     def __init__(self, service_name: str = None):
         """
@@ -144,7 +145,7 @@ class ServiceDiscoveryManager:
             raise ServiceDiscoveryError("zeroconf library not available")
         
         self.zeroconf = Zeroconf()
-        self.service_name = service_name or socket.gethostname()
+        self.service_name = service_name or f"LinuxServer_{socket.gethostname()}"
         self.service_info = None
         self.clients = {}
         self.client_callbacks = []
@@ -168,26 +169,44 @@ class ServiceDiscoveryManager:
             'height': str(height),
             'framerate': str(framerate),
             'version': '1.0',
-            'type': 'linux_server',
+            'type': 'linux_server',  # This is key for Android client filtering
+            'hostname': socket.gethostname(),
+            'os': 'Linux',
             **{k: str(v) for k, v in kwargs.items()}
         }
         
-        # Encode properties for zeroconf
-        encoded_props = {k.encode('utf-8'): v.encode('utf-8') for k, v in properties.items()}
+        # Encode properties for zeroconf - ensure UTF-8 encoding
+        encoded_props = {}
+        for k, v in properties.items():
+            try:
+                key_bytes = k.encode('utf-8')
+                val_bytes = str(v).encode('utf-8')
+                encoded_props[key_bytes] = val_bytes
+            except Exception as e:
+                logger.warning(f"Error encoding property {k}={v}: {e}")
         
-        self.service_info = ServiceInfo(
-            self.SERVICE_TYPE,
-            f"{self.service_name}.{self.SERVICE_TYPE}",
-            addresses=[socket.inet_aton(self._get_local_ip())],
-            port=port,
-            properties=encoded_props,
-            server=f"{self.service_name}.local."
-        )
+        # Create service info
+        service_name = f"{self.service_name}.{self.SERVICE_TYPE}"
         
         try:
+            # Get local IP address
+            local_ip = self._get_local_ip()
+            ip_bytes = socket.inet_aton(local_ip)
+            
+            self.service_info = ServiceInfo(
+                self.SERVICE_TYPE,
+                service_name,
+                addresses=[ip_bytes],
+                port=port,
+                properties=encoded_props,
+                server=f"{socket.gethostname()}.local."
+            )
+            
             self.zeroconf.register_service(self.service_info)
-            logger.info(f"Registered service: {self.service_name} on port {port}")
+            logger.info(f"Registered service: {self.service_name} on {local_ip}:{port}")
+            logger.info(f"Service type: {self.SERVICE_TYPE}")
             logger.info(f"Service properties: {properties}")
+            
         except Exception as e:
             raise ServiceDiscoveryError(f"Failed to register service: {e}")
     
@@ -200,7 +219,8 @@ class ServiceDiscoveryManager:
             ip = s.getsockname()[0]
             s.close()
             return ip
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Could not determine local IP: {e}")
             return "127.0.0.1"
     
     def add_client_callback(self, callback):
@@ -214,7 +234,7 @@ class ServiceDiscoveryManager:
         
         listener = ClientListener(self)
         self.browser = ServiceBrowser(self.zeroconf, self.SERVICE_TYPE, listener)
-        logger.info("Started client discovery")
+        logger.info(f"Started client discovery for service type: {self.SERVICE_TYPE}")
     
     def stop_discovery(self) -> None:
         """Stop discovering clients."""
@@ -233,7 +253,7 @@ class ServiceDiscoveryManager:
         with self._lock:
             self.clients[name] = client_info
             logger.info(f"Discovered client: {name} at {client_info.address}:{client_info.port} "
-                       f"({client_info.width}x{client_info.height})")
+                       f"({client_info.width}x{client_info.height}) [type: {client_info.service_type}]")
         
         # Notify callbacks
         for callback in self.client_callbacks:
@@ -273,20 +293,47 @@ class ClientListener(ServiceListener):
     
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         """Called when a service is discovered."""
+        logger.debug(f"=== SERVICE DISCOVERED ===")
+        logger.debug(f"Name: {name}")
+        logger.debug(f"Type: {type_}")
+        
         info = zc.get_service_info(type_, name)
         if info:
             try:
-                # Decode service properties
+                # Decode service properties safely
                 props = {}
                 if info.properties:
                     for key, value in info.properties.items():
-                        props[key.decode('utf-8')] = value.decode('utf-8')
+                        try:
+                            key_str = key.decode('utf-8') if isinstance(key, bytes) else str(key)
+                            val_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                            props[key_str] = val_str
+                        except Exception as e:
+                            logger.debug(f"Error decoding property {key}={value}: {e}")
                 
-                # Extract client information
-                address = socket.inet_ntoa(info.addresses[0]) if info.addresses else "unknown"
-                width = int(props.get('width', 1920))
-                height = int(props.get('height', 1080))
-                service_type = props.get('type', 'unknown')
+                # Get address safely
+                address = "unknown"
+                if info.addresses:
+                    try:
+                        address = socket.inet_ntoa(info.addresses[0])
+                    except Exception as e:
+                        logger.debug(f"Error decoding address: {e}")
+                
+                logger.debug(f"Properties: {props}")
+                logger.debug(f"Address: {address}")
+                logger.debug(f"Port: {info.port}")
+                
+                # Extract client information with defaults
+                width = 1920
+                height = 1080
+                service_type = "unknown"
+                
+                try:
+                    width = int(props.get('width', '1920'))
+                    height = int(props.get('height', '1080'))
+                    service_type = props.get('type', 'unknown').lower()
+                except ValueError as e:
+                    logger.warning(f"Error parsing numeric properties: {e}")
                 
                 client_info = ClientInfo(
                     name=name,
@@ -298,19 +345,47 @@ class ClientListener(ServiceListener):
                     discovered_at=time.time()
                 )
                 
-                # Only add Android clients (ignore our own service)
-                if service_type.lower() in ['android_client', 'android', 'client']:
+                # More permissive client filtering
+                # Accept Android clients and anything that looks like a client
+                service_name_lower = name.lower()
+                should_accept = False
+                
+                # Check for Android client indicators
+                if any(keyword in service_type for keyword in ['android', 'client']):
+                    should_accept = True
+                    logger.debug(f"Accepting service based on type: {service_type}")
+                
+                # Check service name for client indicators
+                elif any(keyword in service_name_lower for keyword in ['android', 'client', 'streamclient']):
+                    should_accept = True
+                    logger.debug(f"Accepting service based on name: {name}")
+                
+                # Reject our own server services
+                elif any(keyword in service_type for keyword in ['server', 'linux']):
+                    should_accept = False
+                    logger.debug(f"Rejecting server service: {name} (type: {service_type})")
+                
+                # For debugging, accept unknown types but log them
+                elif service_type == 'unknown':
+                    should_accept = True
+                    logger.debug(f"Accepting unknown service type for debugging: {name}")
+                
+                if should_accept:
                     self.manager._add_client(name, client_info)
+                else:
+                    logger.debug(f"Ignoring service {name} with type: {service_type}")
                 
             except Exception as e:
                 logger.error(f"Error processing discovered service {name}: {e}")
     
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         """Called when a service is removed."""
+        logger.debug(f"Service removed: {name}")
         self.manager._remove_client(name)
     
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         """Called when a service is updated."""
+        logger.debug(f"Service updated: {name}")
         # Re-add the service to update information
         self.add_service(zc, type_, name)
 
@@ -1060,7 +1135,66 @@ class ScreenManager:
     def _on_client_discovered(self, name: str, client_info: ClientInfo) -> None:
         """Callback for when a client is discovered."""
         logger.info(f"New client available: {name} ({client_info.width}x{client_info.height})")
-    
+
+    def debug_service_discovery(self):
+        """Debug service discovery by listing all services on the network."""
+        if not self.enable_discovery:
+            logger.warning("Service discovery not available")
+            return
+        
+        logger.info("=== DEBUG: Scanning all services on network ===")
+        
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+        
+        class DebugListener(ServiceListener):
+            def add_service(self, zc, type_, name):
+                info = zc.get_service_info(type_, name)
+                if info:
+                    try:
+                        address = socket.inet_ntoa(info.addresses[0]) if info.addresses else "unknown"
+                        props = {}
+                        if info.properties:
+                            for k, v in info.properties.items():
+                                try:
+                                    key = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+                                    val = v.decode('utf-8') if isinstance(v, bytes) else str(v)
+                                    props[key] = val
+                                except:
+                                    pass
+                        
+                        logger.info(f"Found service: {name}")
+                        logger.info(f"  Type: {type_}")
+                        logger.info(f"  Address: {address}:{info.port}")
+                        logger.info(f"  Properties: {props}")
+                        logger.info(f"  Server: {info.server}")
+                        logger.info("---")
+                    except Exception as e:
+                        logger.error(f"Error processing service {name}: {e}")
+            
+            def remove_service(self, zc, type_, name):
+                logger.info(f"Service removed: {name}")
+            
+            def update_service(self, zc, type_, name):
+                logger.info(f"Service updated: {name}")
+        
+        try:
+            zc = Zeroconf()
+            listener = DebugListener()
+            
+            # Browse for our specific service type
+            browser = ServiceBrowser(zc, "_screenstream._tcp.local.", listener)
+            
+            logger.info("Scanning for 10 seconds...")
+            time.sleep(10)
+            
+            browser.cancel()
+            zc.close()
+            logger.info("=== DEBUG: Scan complete ===")
+            
+        except Exception as e:
+            logger.error(f"Debug scan failed: {e}")
+
+
     def start_service_discovery(self, port: int = 5001, **kwargs) -> None:
         """
         Start service discovery.
@@ -1076,6 +1210,7 @@ class ScreenManager:
         try:
             self.discovery_manager.register_service(port, **kwargs)
             self.discovery_manager.start_discovery()
+            
             logger.info("Service discovery started")
         except Exception as e:
             logger.error(f"Failed to start service discovery: {e}")
@@ -1584,6 +1719,9 @@ def main():
     logger.info(f"Service discovery: {'Enabled' if enable_discovery else 'Disabled'}")
     
     manager = ScreenManager(service_name=args.service_name, enable_discovery=enable_discovery)
+    if args.debug:
+        logger.info("Running debug service discovery scan...")
+        manager.debug_service_discovery()
     
     # Global flag to prevent multiple cleanup calls
     cleanup_done = False
@@ -1616,7 +1754,7 @@ def main():
             manager.start_service_discovery(port=args.stream_port)
             
             # Wait for discovery
-            time.sleep(5)
+            time.sleep(args.discovery_timeout)
             clients = manager.list_clients()
             
             if clients:
